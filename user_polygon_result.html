@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+    
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css"/>
+    <link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.0/css/bootstrap-glyphicons.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.2.0/css/all.min.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/python-visualization/folium/folium/templates/leaflet.awesome.rotate.min.css"/>
+    
+            <meta name="viewport" content="width=device-width,
+                initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+            <style>
+                #map_bbacc31506c335643087c00147e0d590 {
+                    position: relative;
+                    width: 100.0%;
+                    height: 100.0%;
+                    left: 0.0%;
+                    top: 0.0%;
+                }
+                .leaflet-container { font-size: 1rem; }
+            </style>
+
+            <style>html, body {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            </style>
+
+            <style>#map {
+                position:absolute;
+                top:0;
+                bottom:0;
+                right:0;
+                left:0;
+                }
+            </style>
+
+            <script>
+                L_NO_TOUCH = false;
+                L_DISABLE_3D = false;
+            </script>
+
+        
+</head>
+<body>
+    
+    
+            <div class="folium-map" id="map_bbacc31506c335643087c00147e0d590" ></div>
+        
+</body>
+<script>
+    
+    
+            var map_bbacc31506c335643087c00147e0d590 = L.map(
+                "map_bbacc31506c335643087c00147e0d590",
+                {
+                    center: [53.78072364285714, -1.5506416428571428],
+                    crs: L.CRS.EPSG3857,
+                    ...{
+  "zoom": 11,
+  "zoomControl": true,
+  "preferCanvas": false,
+}
+
+                }
+            );
+            L.control.scale().addTo(map_bbacc31506c335643087c00147e0d590);
+
+            
+
+        
+    
+            var tile_layer_a2c8d4968f222b6341f322de317a308b = L.tileLayer(
+                "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                {
+  "minZoom": 0,
+  "maxZoom": 19,
+  "maxNativeZoom": 19,
+  "noWrap": false,
+  "attribution": "\u0026copy; \u003ca href=\"https://www.openstreetmap.org/copyright\"\u003eOpenStreetMap\u003c/a\u003e contributors",
+  "subdomains": "abc",
+  "detectRetina": false,
+  "tms": false,
+  "opacity": 1,
+}
+
+            );
+        
+    
+            tile_layer_a2c8d4968f222b6341f322de317a308b.addTo(map_bbacc31506c335643087c00147e0d590);
+        
+    
+            var polygon_a082de9a5a5b1cd1da28cd187f13a7a7 = L.polygon(
+                [[53.854957, -1.601257], [53.839969, -1.678848], [53.815653, -1.728287], [53.790106, -1.762619], [53.73206, -1.707687], [53.683695, -1.665115], [53.667426, -1.531906], [53.693048, -1.386337], [53.724748, -1.339645], [53.777123, -1.361618], [53.803084, -1.383591], [53.838348, -1.444016], [53.854957, -1.5168], [53.854957, -1.601257]],
+                {"bubblingMouseEvents": true, "color": "black", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "black", "fillOpacity": 0.08, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "noClip": false, "opacity": 1.0, "smoothFactor": 1.0, "stroke": true, "weight": 2}
+            ).addTo(map_bbacc31506c335643087c00147e0d590);
+        
+    
+        var popup_3dfd0917afc15fdd4072b55134408d40 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_07a0c57c630178662fc865c17de21104 = $(`<div id="html_07a0c57c630178662fc865c17de21104" style="width: 100.0%; height: 100.0%;">Boundary polygon</div>`)[0];
+                popup_3dfd0917afc15fdd4072b55134408d40.setContent(html_07a0c57c630178662fc865c17de21104);
+            
+        
+
+        polygon_a082de9a5a5b1cd1da28cd187f13a7a7.bindPopup(popup_3dfd0917afc15fdd4072b55134408d40)
+        ;
+
+        
+    
+    
+            var marker_53a6c983f2b0412848c86c3add55f655 = L.marker(
+                [53.8072, -1.559579],
+                {
+}
+            ).addTo(map_bbacc31506c335643087c00147e0d590);
+        
+    
+            var icon_8712524b60760e7d69ac02479b117b12 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "red",
+  "iconColor": "white",
+  "icon": "info-sign",
+  "prefix": "glyphicon",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_8322824910fab40e11b7ff312250a54f = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_54d91c4f9c6e441e5d6bdab4660f0fdb = $(`<div id="html_54d91c4f9c6e441e5d6bdab4660f0fdb" style="width: 100.0%; height: 100.0%;"><b>Hub 1</b><br>Hub #1<br>Postcode: LS2 9LB<br>Lat/Lon: 53.807200, -1.559579<br>Postcodes: 7,835<br>Population: 379,894<br>Households: 158,231<br>Potential population: 534,872<br>Overlap population: 154,978</div>`)[0];
+                popup_8322824910fab40e11b7ff312250a54f.setContent(html_54d91c4f9c6e441e5d6bdab4660f0fdb);
+            
+        
+
+        marker_53a6c983f2b0412848c86c3add55f655.bindPopup(popup_8322824910fab40e11b7ff312250a54f)
+        ;
+
+        
+    
+    
+            marker_53a6c983f2b0412848c86c3add55f655.bindTooltip(
+                `<div>
+                     Hub 1
+                 </div>`,
+                {
+  "sticky": true,
+}
+            );
+        
+    
+                marker_53a6c983f2b0412848c86c3add55f655.setIcon(icon_8712524b60760e7d69ac02479b117b12);
+            
+    
+            var circle_42a57c8ca41fbbc38c57d49f27a318d2 = L.circle(
+                [53.8072, -1.559579],
+                {"bubblingMouseEvents": true, "color": "red", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "red", "fillOpacity": 0.18, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 8046.7, "stroke": true, "weight": 3}
+            ).addTo(map_bbacc31506c335643087c00147e0d590);
+        
+    
+        var popup_d6519ace2737634daac4353e5212a3fb = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_c9e00fd2bd74787da04fee958ce2eec0 = $(`<div id="html_c9e00fd2bd74787da04fee958ce2eec0" style="width: 100.0%; height: 100.0%;">Hub 1 radius: 5.0 miles</div>`)[0];
+                popup_d6519ace2737634daac4353e5212a3fb.setContent(html_c9e00fd2bd74787da04fee958ce2eec0);
+            
+        
+
+        circle_42a57c8ca41fbbc38c57d49f27a318d2.bindPopup(popup_d6519ace2737634daac4353e5212a3fb)
+        ;
+
+        
+    
+    
+            var marker_f851af26e1f6211e6fa74b335e6a1cdb = L.marker(
+                [53.72864, -1.573419],
+                {
+}
+            ).addTo(map_bbacc31506c335643087c00147e0d590);
+        
+    
+            var icon_339bef68847989a715eef16db6fe9719 = L.AwesomeMarkers.icon(
+                {
+  "markerColor": "blue",
+  "iconColor": "white",
+  "icon": "info-sign",
+  "prefix": "glyphicon",
+  "extraClasses": "fa-rotate-0",
+}
+            );
+        
+    
+        var popup_9a84c803cbb70f1175e806b45c5b3fb9 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_46f01054007c4a3f7236f87e16120cba = $(`<div id="html_46f01054007c4a3f7236f87e16120cba" style="width: 100.0%; height: 100.0%;"><b>Hub 2</b><br>Hub #2<br>Postcode: WF3 1UR<br>Lat/Lon: 53.728640, -1.573419<br>Postcodes: 5,573<br>Population: 236,201<br>Households: 95,940<br>Potential population: 391,179<br>Overlap population: 154,978</div>`)[0];
+                popup_9a84c803cbb70f1175e806b45c5b3fb9.setContent(html_46f01054007c4a3f7236f87e16120cba);
+            
+        
+
+        marker_f851af26e1f6211e6fa74b335e6a1cdb.bindPopup(popup_9a84c803cbb70f1175e806b45c5b3fb9)
+        ;
+
+        
+    
+    
+            marker_f851af26e1f6211e6fa74b335e6a1cdb.bindTooltip(
+                `<div>
+                     Hub 2
+                 </div>`,
+                {
+  "sticky": true,
+}
+            );
+        
+    
+                marker_f851af26e1f6211e6fa74b335e6a1cdb.setIcon(icon_339bef68847989a715eef16db6fe9719);
+            
+    
+            var circle_d1d4daee10af49ba531ad1bd5b6176ac = L.circle(
+                [53.72864, -1.573419],
+                {"bubblingMouseEvents": true, "color": "blue", "dashArray": null, "dashOffset": null, "fill": true, "fillColor": "blue", "fillOpacity": 0.18, "fillRule": "evenodd", "lineCap": "round", "lineJoin": "round", "opacity": 1.0, "radius": 8046.7, "stroke": true, "weight": 3}
+            ).addTo(map_bbacc31506c335643087c00147e0d590);
+        
+    
+        var popup_af3029998a7638f1405a47bf358a03d0 = L.popup({
+  "maxWidth": "100%",
+});
+
+        
+            
+                var html_099682ba4e58976270b1f8b5fe7610f2 = $(`<div id="html_099682ba4e58976270b1f8b5fe7610f2" style="width: 100.0%; height: 100.0%;">Hub 2 radius: 5.0 miles</div>`)[0];
+                popup_af3029998a7638f1405a47bf358a03d0.setContent(html_099682ba4e58976270b1f8b5fe7610f2);
+            
+        
+
+        circle_d1d4daee10af49ba531ad1bd5b6176ac.bindPopup(popup_af3029998a7638f1405a47bf358a03d0)
+        ;
+
+        
+    
+</script>
+</html>
