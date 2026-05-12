@@ -168,7 +168,7 @@ candidate_stride = st.sidebar.number_input(
 st.sidebar.markdown("---")
 st.sidebar.header("Fixed Hubs (optional)")
 
-max_fixed = int(num_hubs) - 1
+max_fixed = int(num_hubs)
 num_fixed = int(st.sidebar.number_input(
     "Number of fixed hubs",
     min_value=0,
@@ -187,7 +187,11 @@ for i in range(num_fixed):
     fixed_hubs_input.append((name.strip(), float(lat), float(lon)))
 
 if num_fixed > 0:
-    st.sidebar.caption(f"↳ {int(num_hubs) - num_fixed} hub(s) will be optimized automatically.")
+    num_free = int(num_hubs) - num_fixed
+    if num_free > 0:
+        st.sidebar.caption(f"↳ {num_free} hub(s) will be optimized automatically.")
+    else:
+        st.sidebar.caption("↳ All hubs are fixed — no optimization will run.")
 
 # --------------------------------------------------
 # Map
