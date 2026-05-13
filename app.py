@@ -17,6 +17,32 @@ from main import (
 # --------------------------------------------------
 # Helpers
 # --------------------------------------------------
+def download_buttons(multi_df, single_df, key_prefix="top"):
+    """Render the two postcode download buttons side-by-side."""
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.download_button(
+            label="⬇️ Download covered postcodes (all hubs)",
+            data=multi_df.to_csv(index=False),
+            file_name="covered_postcodes_all_hubs.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_multi",
+            help="Each postcode appears once per hub that covers it.",
+            use_container_width=True,
+        )
+
+    with c2:
+        st.download_button(
+            label="⬇️ Download covered postcodes (nearest hub only)",
+            data=single_df.to_csv(index=False),
+            file_name="covered_postcodes_nearest_hub.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_single",
+            help="Each postcode is assigned exclusively to its nearest hub.",
+            use_container_width=True,
+        )
+
 
 def geojson_polygon_to_latlon_list(geojson_geometry):
     if not geojson_geometry:
@@ -112,6 +138,13 @@ def render_results(result, map_filename="user_polygon_result.html"):
     c2.metric("Covered Population",      f"{result['covered_population']:,.0f}")
     c3.metric("Coverage",                f"{result['coverage_pct']:.1f}%")
 
+    # ← NEW: top-level download buttons
+    multi_df  = result.get("multi_hub_df",  pd.DataFrame())
+    single_df = result.get("single_hub_df", pd.DataFrame())
+    if not multi_df.empty:
+        st.markdown("#### Download Covered Postcodes")
+        download_buttons(multi_df, single_df, key_prefix="top")
+
     st.markdown("#### Hub Summary")
     st.dataframe(build_results_df(result["hubs"]), use_container_width=True, hide_index=True)
 
@@ -119,6 +152,8 @@ def render_results(result, map_filename="user_polygon_result.html"):
     for h in result["hubs"]:
         hub_label = h.get("hub_name", f"Hub {h['hub_number']}")
         postcode  = h.get("hub_postcode", "")
+        hub_num   = h["hub_number"]
+
         with st.expander(f"{hub_label}  —  {postcode}"):
             area_types = h.get("top_area_types", {})
             if area_types:
@@ -130,8 +165,18 @@ def render_results(result, map_filename="user_polygon_result.html"):
             else:
                 st.write("No net-new coverage for this hub.")
 
-    st.caption("Map output saved to `user_polygon_result.html`.")
+            if not multi_df.empty:
+                hub_multi  = multi_df[multi_df["Hub Number"] == hub_num]
+                hub_single = single_df[single_df["Hub Number"] == hub_num]
 
+                st.markdown("**Download postcodes for this hub**")
+                download_buttons(
+                    hub_multi,
+                    hub_single,
+                    key_prefix=f"hub_{hub_num}",
+                )
+
+    st.caption("Map output saved to `user_polygon_result.html`.")
     st.markdown("#### Coverage Map")
     try:
         with open(map_filename, "r", encoding="utf-8") as f:

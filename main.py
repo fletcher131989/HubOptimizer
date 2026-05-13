@@ -626,13 +626,20 @@ def run_fixed_hub_coverage_polygon(
             boundary_points=cleaned_polygon,
         )
 
+    multi_df, single_df = build_postcode_hub_mappings(
+        area_df, hub_results, hub_radius_km, radius_unit
+    )
+
     return {
         "hubs": hub_results,
         "covered_postcodes": covered,
         "total_population": total_population,
         "covered_population": covered_population,
         "coverage_pct": coverage_pct,
-        "boundary_points": cleaned_polygon
+        "boundary_points": cleaned_polygon,
+        "radius_unit": radius_unit,
+        "multi_hub_df": multi_df,
+        "single_hub_df": single_df,
     }
 
 
@@ -725,6 +732,10 @@ def run_hybrid_optimisation_polygon(
         boundary_points=cleaned_polygon,
     )
 
+    multi_df, single_df = build_postcode_hub_mappings(
+        area_df, all_hubs, hub_radius_km, radius_unit
+    )
+
     return {
         "hubs":               all_hubs,
         "covered_postcodes":  covered_postcodes,
@@ -732,6 +743,9 @@ def run_hybrid_optimisation_polygon(
         "covered_population": covered_population,
         "coverage_pct":       coverage_pct,
         "boundary_points":    cleaned_polygon,
+        "radius_unit": radius_unit,
+        "multi_hub_df": multi_df,
+        "single_hub_df": single_df,
     }
 
 
@@ -1224,13 +1238,20 @@ def run_hub_optimisation_polygon(
             boundary_points=cleaned_polygon,
         )
 
+    multi_df, single_df = build_postcode_hub_mappings(
+        area_df, hubs, hub_radius_km, radius_unit
+    )
+
     return {
         "hubs": hubs,
         "covered_postcodes": covered,
         "total_population": float(total_population),
         "covered_population": float(covered_population),
         "coverage_pct": float(coverage_pct),
-        "boundary_points": cleaned_polygon
+        "boundary_points": cleaned_polygon,
+        "radius_unit": radius_unit,
+        "multi_hub_df": multi_df,
+        "single_hub_df": single_df,
     }
 
 
@@ -1244,6 +1265,85 @@ def find_nearest_postcode(lat, lon, df):
 
     nearest_idx = int(np.argmin(distances))
     return df.iloc[nearest_idx]["postcode"]
+
+
+def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit="miles"):
+    """
+    Returns two DataFrames:
+      multi_df  – one row per (postcode, hub) pair where the hub covers that postcode.
+      single_df – one row per postcode, assigned to its nearest covering hub
+                  (tie-broken by hub_number, i.e. order placed during optimisation).
+    """
+    dist_col = f"Distance ({radius_unit})"
+    cols = ["Postcode", "Lat", "Lon", "Hub", "Hub Number", dist_col]
+
+    if area_df.empty or not hub_results:
+        empty = pd.DataFrame(columns=cols)
+        return empty, empty.copy()
+
+    pc_lats = area_df["lat"].to_numpy()
+    pc_lons = area_df["lon"].to_numpy()
+
+    multi_rows = []
+    # idx -> (dist_km, hub_number, hub_name, dist_display)
+    best: dict[int, tuple] = {}
+
+    for hub in hub_results:
+        hub_lat    = hub["lat"]
+        hub_lon    = hub["lon"]
+        hub_name   = hub.get("hub_name", f"Hub {hub['hub_number']}")
+        hub_number = hub["hub_number"]
+
+        dists_km = haversine_array(hub_lat, hub_lon, pc_lats, pc_lons)
+        dists_display = dists_km / KM_PER_MILE if radius_unit.lower() in ("mile", "miles", "mi") else dists_km
+
+        for idx in np.where(dists_km <= hub_radius_km)[0]:
+            row   = area_df.iloc[idx]
+            d_km  = float(dists_km[idx])
+            d_dis = float(dists_display[idx])
+
+            multi_rows.append({
+                "Postcode":   row["postcode"],
+                "Lat":        round(float(row["lat"]), 5),
+                "Lon":        round(float(row["lon"]), 5),
+                "Hub":        hub_name,
+                "Hub Number": hub_number,
+                dist_col:     round(d_dis, 4),
+            })
+
+            # nearest-hub logic: lower distance wins; tie → lower hub_number
+            prev = best.get(idx)
+            if prev is None or d_km < prev[0] or (d_km == prev[0] and hub_number < prev[1]):
+                best[idx] = (d_km, hub_number, hub_name, d_dis)
+
+    multi_df = (
+        pd.DataFrame(multi_rows, columns=cols)
+        .sort_values(["Hub Number", "Postcode"])
+        .reset_index(drop=True)
+        if multi_rows else pd.DataFrame(columns=cols)
+    )
+
+    single_rows = [
+        {
+            "Postcode":   area_df.iloc[idx]["postcode"],
+            "Lat":        round(float(area_df.iloc[idx]["lat"]), 5),
+            "Lon":        round(float(area_df.iloc[idx]["lon"]), 5),
+            "Hub":        hub_name,
+            "Hub Number": hub_number,
+            dist_col:     round(d_dis, 4),
+        }
+        for idx, (_, hub_number, hub_name, d_dis) in best.items()
+    ]
+
+    single_df = (
+        pd.DataFrame(single_rows, columns=cols)
+        .sort_values(["Hub Number", "Postcode"])
+        .reset_index(drop=True)
+        if single_rows else pd.DataFrame(columns=cols)
+    )
+
+    return multi_df, single_df
+
 
 
 if __name__ == "__main__":
