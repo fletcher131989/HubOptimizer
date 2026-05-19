@@ -70,15 +70,14 @@ def convert_to_km(distance, unit):
 
 def load_postcode_data():
 
-    files = [
-        DATA_FOLDER / "Postcodes.csv"
-    ]
-
+    files = sorted(DATA_FOLDER.glob("*.csv"))
 
     dfs = []
 
     for f in files:
-        df = pd.read_csv(f)
+        print(f"Loading {f.name}")
+
+        df = pd.read_csv(f, low_memory=False)
         df.columns = df.columns.str.strip()
 
         df = df[[
@@ -106,12 +105,16 @@ def load_postcode_data():
 
         dfs.append(df)
 
+    if not dfs:
+        raise FileNotFoundError(f"No CSV files found in {DATA_FOLDER}")
+
     df = pd.concat(dfs, ignore_index=True)
+
     df = df.dropna(subset=["lat", "lon"])
     df = df[df["lat"].between(49, 61) & df["lon"].between(-8, 2)]
     df = df[df["population"] > 0]
 
-    print(f"Loaded {len(df):,} rows")
+    print(f"Loaded {len(df):,} rows from {len(files)} files")
 
     return df
 
