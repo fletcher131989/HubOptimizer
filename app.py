@@ -29,7 +29,7 @@ def download_buttons(multi_df, single_df, key_prefix="top"):
             mime="text/csv",
             key=f"{key_prefix}_multi",
             help="Each postcode appears once per hub that covers it.",
-            use_container_width=True,
+            width='stretch',
         )
 
     with c2:
@@ -40,7 +40,7 @@ def download_buttons(multi_df, single_df, key_prefix="top"):
             mime="text/csv",
             key=f"{key_prefix}_single",
             help="Each postcode is assigned exclusively to its nearest hub.",
-            use_container_width=True,
+            width='stretch',
         )
 
 
@@ -146,7 +146,7 @@ def render_results(result, map_filename="user_polygon_result.html"):
         download_buttons(multi_df, single_df, key_prefix="top")
 
     st.markdown("#### Hub Summary")
-    st.dataframe(build_results_df(result["hubs"]), use_container_width=True, hide_index=True)
+    st.dataframe(build_results_df(result["hubs"]), width='stretch', hide_index=True)
 
     st.markdown("#### Top Area Types per Hub")
     for h in result["hubs"]:
@@ -160,7 +160,7 @@ def render_results(result, map_filename="user_polygon_result.html"):
                 st.dataframe(
                     pd.DataFrame(list(area_types.items()), columns=["Area Type", "Postcodes"]),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch'
                 )
             else:
                 st.write("No net-new coverage for this hub.")
