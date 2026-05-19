@@ -71,9 +71,9 @@ def convert_to_km(distance, unit):
 def load_postcode_data():
 
     files = [
-        DATA_FOLDER / "Postcodes_AB-PL.csv",
-        DATA_FOLDER / "Postcodes_PO-ZE.csv"
+        DATA_FOLDER / "Postcodes.csv"
     ]
+
 
     dfs = []
 
