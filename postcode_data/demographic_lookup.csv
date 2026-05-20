@@ -1,3 +1,77 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:e91c51bd3b0c3e8753fb821e614ca17121e984c01a813f7bceb9875d9c5b459b
-size 5506
+OAC_Subgroup_Code,OAC_Goup_Name,OAC_Subgroup_Name,OAC_Supergroup_Name
+1a1,Farming Communities,Rural Workers and Families,Rural Residents
+1a2,Farming Communities,Established Farming Communities,Rural Residents
+1a3,Farming Communities,Agricultural Communities,Rural Residents
+1a4,Farming Communities,Older Farming Communities,Rural Residents
+1b1,Rural Tenants,Rural Life,Rural Residents
+1b2,Rural Tenants,Rural White-Collar Workers,Rural Residents
+1b3,Rural Tenants,Ageing Rural Flat Tenants,Rural Residents
+1c1,Ageing Rural Dwellers,Rural Employment and Retirees,Rural Residents
+1c2,Ageing Rural Dwellers,Renting Rural Retirement,Rural Residents
+1c3,Ageing Rural Dwellers,Detached Rural Retirement,Rural Residents
+2a1,Students Around Campus,Student Communal Living,Cosmopolitans
+2a2,Students Around Campus,Student Digs,Cosmopolitans
+2a3,Students Around Campus,Students and Professionals,Cosmopolitans
+2b1,Inner-City Students,Students and Commuters,Cosmopolitans
+2b2,Inner-City Students,Multicultural Student Neighbourhoods,Cosmopolitans
+2c1,Comfortable Cosmopolitans,Migrant Families,Cosmopolitans
+2c2,Comfortable Cosmopolitans,Migrant Commuters,Cosmopolitans
+2c3,Comfortable Cosmopolitans,Professional Service Cosmopolitans,Cosmopolitans
+2d1,Aspiring and Affluent,Urban Cultural Mix,Cosmopolitans
+2d2,Aspiring and Affluent,Highly-Qualified Quaternary Workers,Cosmopolitans
+2d3,Aspiring and Affluent,EU White-Collar Workers,Cosmopolitans
+3a1,Ethnic Family Life,Established Renting Families,Ethnicity Central
+3a2,Ethnic Family Life,Young Families and Students,Ethnicity Central
+3b1,Endeavouring Ethnic Mix,Striving Service Workers,Ethnicity Central
+3b2,Endeavouring Ethnic Mix,Bangladeshi Mixed Employment,Ethnicity Central
+3b3,Endeavouring Ethnic Mix,Multi-Ethnic Professional Service Workers,Ethnicity Central
+3c1,Ethnic Dynamics,Constrained Neighbourhoods,Ethnicity Central
+3c2,Ethnic Dynamics,Constrained Commuters,Ethnicity Central
+3d1,Aspirational Techies,New EU Tech Workers,Ethnicity Central
+3d2,Aspirational Techies,Established Tech Workers,Ethnicity Central
+3d3,Aspirational Techies,Old EU Tech Workers,Ethnicity Central
+4a1,Rented Family Living,Social Renting Young Families,Multicultural Metropolitans
+4a2,Rented Family Living,Private Renting New Arrivals,Multicultural Metropolitans
+4a3,Rented Family Living,Commuters with Young Families,Multicultural Metropolitans
+4b1,Challenged Asian Terraces,Asian Terraces and Flats,Multicultural Metropolitans
+4b2,Challenged Asian Terraces,Pakistani Communities,Multicultural Metropolitans
+4c1,Asian Traits,Achieving Minorities,Multicultural Metropolitans
+4c2,Asian Traits,Multicultural New Arrivals,Multicultural Metropolitans
+4c3,Asian Traits,Inner City Ethnic Mix,Multicultural Metropolitans
+5a1,Urban Professionals and Families,White Professionals,Urbanites
+5a2,Urban Professionals and Families,Multi-Ethnic Professionals with Families,Urbanites
+5a3,Urban Professionals and Families,Families in Terraces and Flats ,Urbanites
+5b1,Ageing Urban Living,Delayed Retirement,Urbanites
+5b2,Ageing Urban Living,Communal Retirement,Urbanites
+5b3,Ageing Urban Living,Self-Sufficient Retirement,Urbanites
+6a1,Suburban Achievers,Indian Tech Achievers,Suburbanites
+6a2,Suburban Achievers,Comfortable Suburbia,Suburbanites
+6a3,Suburban Achievers,Detached Retirement Living,Suburbanites
+6a4,Suburban Achievers,Ageing in Suburbia,Suburbanites
+6b1,Semi-Detached Suburbia,Multi-Ethnic Suburbia,Suburbanites
+6b2,Semi-Detached Suburbia,White Suburban Communities,Suburbanites
+6b3,Semi-Detached Suburbia,Semi-Detached Ageing,Suburbanites
+6b4,Semi-Detached Suburbia,Older Workers and Retirement,Suburbanites
+7a1,Challenged Diversity,Transitional Eastern European Neighbourhoods,Constrained City Dwellers
+7a2,Challenged Diversity,Hampered Aspiration,Constrained City Dwellers
+7a3,Challenged Diversity,Multi-Ethnic Hardship,Constrained City Dwellers
+7b1,Constrained Flat Dwellers,Eastern European Communities,Constrained City Dwellers
+7b2,Constrained Flat Dwellers,Deprived Neighbourhoods,Constrained City Dwellers
+7b3,Constrained Flat Dwellers,Endeavouring Flat Dwellers,Constrained City Dwellers
+7c1,White Communities,Challenged Transitionaries,Constrained City Dwellers
+7c2,White Communities,Constrained Young Families,Constrained City Dwellers
+7c3,White Communities,Outer City Hardship,Constrained City Dwellers
+7d1,Ageing City Dwellers,Ageing Communities and Families,Constrained City Dwellers
+7d2,Ageing City Dwellers,Retired Independent City Dwellers,Constrained City Dwellers
+7d3,Ageing City Dwellers,Retired Communal City Dwellers,Constrained City Dwellers
+7d4,Ageing City Dwellers,Retired City Hardship,Constrained City Dwellers
+8a1,Industrious Communities,Industrious Transitions,Hard-Pressed Living
+8a2,Industrious Communities,Industrious Hardship,Hard-Pressed Living
+8b1,Challenged Terraced Workers,Deprived Blue-Collar Terraces,Hard-Pressed Living
+8b2,Challenged Terraced Workers,Hard-Pressed Rented Terraces,Hard-Pressed Living
+8c1,Hard-Pressed Ageing Workers,Ageing Industrious Workers,Hard-Pressed Living
+8c2,Hard-Pressed Ageing Workers,Ageing Rural Industry Workers,Hard-Pressed Living
+8c3,Hard-Pressed Ageing Workers,Renting Hard-Pressed Workers,Hard-Pressed Living
+8d1,Migration and Churn,Young Hard-Pressed Families,Hard-Pressed Living
+8d2,Migration and Churn,Hard-Pressed Ethnic Mix,Hard-Pressed Living
+8d3,Migration and Churn,Hard-Pressed European Settlers,Hard-Pressed Living
