@@ -83,17 +83,33 @@ def load_postcode_data():
     df = pd.read_csv(base_file, low_memory=False)
     df.columns = df.columns.str.strip()
 
+    print("Base file columns:")
+    print(df.columns.tolist())
+
+    # Normalise column names for matching
+    col_lookup = {c.lower(): c for c in df.columns}
+
+    required = ["pcd", "lat", "long", "oac11"]
+    missing = [c for c in required if c not in col_lookup]
+
+    if missing:
+        raise ValueError(
+            f"postcode_base.csv is missing required columns: {missing}. "
+            f"Available columns are: {df.columns.tolist()}"
+        )
+
     df = df[[
-        "pcd",
-        "lat",
-        "long",
-        "oac11"
+        col_lookup["pcd"],
+        col_lookup["lat"],
+        col_lookup["long"],
+        col_lookup["oac11"]
     ]].copy()
 
     df = df.rename(columns={
-        "pcd": "postcode",
-        "long": "lon",
-        "oac11": "oac_subgroup_code"
+        col_lookup["pcd"]: "postcode",
+        col_lookup["lat"]: "lat",
+        col_lookup["long"]: "lon",
+        col_lookup["oac11"]: "oac_subgroup_code"
     })
 
     df["postcode"] = df["postcode"].astype(str).str.strip().str.upper()
