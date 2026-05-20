@@ -105,6 +105,13 @@ def load_postcode_data():
         col_lookup["oac11"]
     ]].copy()
 
+    df = pd.read_csv(base_file, low_memory=False)
+    df.columns = df.columns.str.strip()
+
+    st.write("Loaded base file:", base_file)
+    st.write("Base columns:", df.columns.tolist())
+    st.write("First rows:", df.head())
+
     df = df.rename(columns={
         col_lookup["pcd"]: "postcode",
         col_lookup["lat"]: "lat",
