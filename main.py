@@ -66,68 +66,40 @@ def convert_to_km(distance, unit):
 # Load postcode data
 # --------------------------------------------------
 
+def build_postcode_parquet_data(chunk_size=250_000):
+    """
+    Run locally to build deployable parquet files from raw CSV sources.
 
+    Raw inputs:
+      postcode_data/postcode_base.csv
+      postcode_data/postcode_populations_2.csv
+      postcode_data/postcode_populations.csv
+      postcode_data/demographic_lookup.csv
 
-def load_postcode_data():
+    Output:
+      postcode_parquet/postcodes_part_000.parquet
+      postcode_parquet/postcodes_part_001.parquet
+      ...
+    """
 
-    base_file = DATA_FOLDER / "postcode_base.csv"
-    population_file_1 = DATA_FOLDER / "postcode_population_2.csv"
-    population_file_2 = DATA_FOLDER / "postcode_population.csv"
-    demographic_file = DATA_FOLDER / "demographic_lookup.csv"
+    raw_folder = DATA_FOLDER
+    parquet_folder = Path("postcode_parquet")
+    parquet_folder.mkdir(exist_ok=True)
+
+    base_file = raw_folder / "postcode_base.csv"
+    population_file_1 = raw_folder / "postcode_populations_2.csv"
+    population_file_2 = raw_folder / "postcode_populations.csv"
+    demographic_file = raw_folder / "demographic_lookup.csv"
 
     if not base_file.exists():
         raise FileNotFoundError(f"Missing base postcode file: {base_file}")
 
-    print(f"Loading {base_file.name}")
-
-    df = pd.read_csv(base_file, low_memory=False)
-    df.columns = df.columns.str.strip()
-
-    print("Base file columns:")
-    print(df.columns.tolist())
-
-    # Normalise column names for matching
-    col_lookup = {c.lower(): c for c in df.columns}
-
-    required = ["pcd", "lat", "long", "oac11"]
-    missing = [c for c in required if c not in col_lookup]
-
-    if missing:
-        raise ValueError(
-            f"postcode_base.csv is missing required columns: {missing}. "
-            f"Available columns are: {df.columns.tolist()}"
-        )
-
-    df = df[[
-        col_lookup["pcd"],
-        col_lookup["lat"],
-        col_lookup["long"],
-        col_lookup["oac11"]
-    ]].copy()
-
-    df = pd.read_csv(base_file, low_memory=False)
-    df.columns = df.columns.str.strip()
-
-    st.write("Loaded base file:", base_file)
-    st.write("Base columns:", df.columns.tolist())
-    st.write("First rows:", df.head())
-
-    df = df.rename(columns={
-        col_lookup["pcd"]: "postcode",
-        col_lookup["lat"]: "lat",
-        col_lookup["long"]: "lon",
-        col_lookup["oac11"]: "oac_subgroup_code"
-    })
-
-    df["postcode"] = df["postcode"].astype(str).str.strip().str.upper()
-    df["oac_subgroup_code"] = df["oac_subgroup_code"].astype(str).str.strip().str.upper()
-
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    # Clear old parquet output
+    for old_file in parquet_folder.glob("*.parquet"):
+        old_file.unlink()
 
     # -----------------------------
-    # Population source 1 - preferred
-    # postcode_population_2.csv
+    # Build population lookup
     # -----------------------------
     if population_file_1.exists():
         print(f"Loading {population_file_1.name}")
@@ -135,12 +107,7 @@ def load_postcode_data():
         pop = pd.read_csv(population_file_1, low_memory=False)
         pop.columns = pop.columns.str.strip()
 
-        pop = pop[[
-            "Postcode",
-            "Total",
-            "Occupied_Households"
-        ]].copy()
-
+        pop = pop[["Postcode", "Total", "Occupied_Households"]].copy()
         pop = pop.rename(columns={
             "Postcode": "postcode",
             "Total": "population",
@@ -156,21 +123,13 @@ def load_postcode_data():
             "households": "sum"
         })
 
-    # -----------------------------
-    # Population source 2 - fallback
-    # postcode_population.csv
-    # -----------------------------
     elif population_file_2.exists():
         print(f"Loading {population_file_2.name}")
 
         pop_raw = pd.read_csv(population_file_2, low_memory=False)
         pop_raw.columns = pop_raw.columns.str.strip()
 
-        pop_raw = pop_raw[[
-            "Postcode",
-            "Count"
-        ]].copy()
-
+        pop_raw = pop_raw[["Postcode", "Count"]].copy()
         pop_raw = pop_raw.rename(columns={
             "Postcode": "postcode",
             "Count": "population"
@@ -182,29 +141,14 @@ def load_postcode_data():
         pop = pop_raw.groupby("postcode", as_index=False).agg({
             "population": "sum"
         })
-
         pop["households"] = 0
 
     else:
-        print("No population file found. Setting population and households to zero.")
-
-        pop = pd.DataFrame(columns=[
-            "postcode",
-            "population",
-            "households"
-        ])
-
-    df = df.merge(
-        pop,
-        on="postcode",
-        how="left"
-    )
-
-    df["population"] = pd.to_numeric(df["population"], errors="coerce").fillna(0)
-    df["households"] = pd.to_numeric(df["households"], errors="coerce").fillna(0)
+        print("No population file found. Population and households will be zero.")
+        pop = pd.DataFrame(columns=["postcode", "population", "households"])
 
     # -----------------------------
-    # Demographic lookup
+    # Build demographic lookup
     # -----------------------------
     if demographic_file.exists():
         print(f"Loading {demographic_file.name}")
@@ -228,34 +172,119 @@ def load_postcode_data():
 
         demo["oac_subgroup_code"] = demo["oac_subgroup_code"].astype(str).str.strip().str.upper()
 
-        df = df.merge(
-            demo,
-            on="oac_subgroup_code",
-            how="left"
+    else:
+        print("No demographic lookup file found.")
+        demo = pd.DataFrame(columns=[
+            "oac_subgroup_code",
+            "oac_group_name",
+            "area_type",
+            "oac_supergroup_name"
+        ])
+
+    # -----------------------------
+    # Stream base postcodes in chunks
+    # -----------------------------
+    print(f"Reading {base_file.name} in chunks...")
+
+    output_count = 0
+    total_rows = 0
+
+    for i, chunk in enumerate(pd.read_csv(base_file, chunksize=chunk_size, low_memory=False)):
+        print(f"Processing chunk {i + 1}")
+
+        chunk.columns = chunk.columns.str.strip()
+        col_lookup = {c.lower(): c for c in chunk.columns}
+
+        required = ["pcd", "lat", "long", "oac11"]
+        missing = [c for c in required if c not in col_lookup]
+
+        if missing:
+            raise ValueError(
+                f"{base_file.name} is missing required columns: {missing}. "
+                f"Available columns are: {chunk.columns.tolist()}"
+            )
+
+        df = chunk[[
+            col_lookup["pcd"],
+            col_lookup["lat"],
+            col_lookup["long"],
+            col_lookup["oac11"]
+        ]].copy()
+
+        df = df.rename(columns={
+            col_lookup["pcd"]: "postcode",
+            col_lookup["lat"]: "lat",
+            col_lookup["long"]: "lon",
+            col_lookup["oac11"]: "oac_subgroup_code"
+        })
+
+        df["postcode"] = df["postcode"].astype(str).str.strip().str.upper()
+        df["oac_subgroup_code"] = df["oac_subgroup_code"].astype(str).str.strip().str.upper()
+
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+
+        df = df.merge(pop, on="postcode", how="left")
+        df["population"] = pd.to_numeric(df["population"], errors="coerce").fillna(0)
+        df["households"] = pd.to_numeric(df["households"], errors="coerce").fillna(0)
+
+        df = df.merge(demo, on="oac_subgroup_code", how="left")
+
+        df["oac_group_name"] = df["oac_group_name"].fillna("Other")
+        df["area_type"] = df["area_type"].fillna("Other")
+        df["oac_supergroup_name"] = df["oac_supergroup_name"].fillna("Other")
+
+        df = df.dropna(subset=["lat", "lon"])
+        df = df[
+            df["lat"].between(49, 61) &
+            df["lon"].between(-8, 2)
+        ]
+
+        output_file = parquet_folder / f"postcodes_part_{i:03d}.parquet"
+        df.to_parquet(output_file, index=False)
+
+        total_rows += len(df)
+        output_count += 1
+
+    print(f"Created {output_count} parquet files in {parquet_folder}")
+    print(f"Total rows written: {total_rows:,}")
+
+# if __name__ == "__main__":
+#     build_postcode_parquet_data()
+
+
+@st.cache_data
+def load_postcode_data():
+
+    parquet_folder = Path("postcode_parquet")
+    files = sorted(parquet_folder.glob("*.parquet"))
+
+    if not files:
+        raise FileNotFoundError(
+            f"No parquet files found in {parquet_folder}. "
+            "Run build_postcode_parquet_data() locally first."
         )
 
-    else:
-        print("No demographic lookup file found. Setting demographic fields to Other.")
+    dfs = []
 
-        df["oac_group_name"] = "Other"
-        df["area_type"] = "Other"
-        df["oac_supergroup_name"] = "Other"
+    for f in files:
+        print(f"Loading {f.name}")
+        dfs.append(pd.read_parquet(f))
 
-    df["oac_group_name"] = df["oac_group_name"].fillna("Other")
-    df["area_type"] = df["area_type"].fillna("Other")
-    df["oac_supergroup_name"] = df["oac_supergroup_name"].fillna("Other")
+    df = pd.concat(dfs, ignore_index=True)
 
-    # Keep all postcodes where lat/lon is valid
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    df["population"] = pd.to_numeric(df["population"], errors="coerce").fillna(0)
+    df["households"] = pd.to_numeric(df["households"], errors="coerce").fillna(0)
+
     df = df.dropna(subset=["lat", "lon"])
     df = df[
         df["lat"].between(49, 61) &
         df["lon"].between(-8, 2)
     ]
 
-    print(f"Loaded {len(df):,} postcodes")
-    print(f"Total population matched: {df['population'].sum():,.0f}")
-    print(f"Postcodes with population: {(df['population'] > 0).sum():,}")
-    print(f"Postcodes without population: {(df['population'] == 0).sum():,}")
+    print(f"Loaded {len(df):,} postcodes from {len(files)} parquet files")
 
     return df
 
