@@ -253,7 +253,6 @@ def build_postcode_parquet_data(chunk_size=250_000):
 #     build_postcode_parquet_data()
 
 
-@st.cache_data
 def load_postcode_data():
 
     parquet_folder = Path("postcode_parquet")
