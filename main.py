@@ -70,51 +70,169 @@ def convert_to_km(distance, unit):
 
 def load_postcode_data():
 
-    files = sorted(DATA_FOLDER.glob("*.csv"))
+    base_file = DATA_FOLDER / "postcode_base.csv"
+    population_file_1 = DATA_FOLDER / "postcode_population_2.csv"
+    population_file_2 = DATA_FOLDER / "postcode_population.csv"
+    demographic_file = DATA_FOLDER / "demographic_lookup.csv"
 
-    dfs = []
+    if not base_file.exists():
+        raise FileNotFoundError(f"Missing base postcode file: {base_file}")
 
-    for f in files:
-        print(f"Loading {f.name}")
+    print(f"Loading {base_file.name}")
 
-        df = pd.read_csv(f, low_memory=False)
-        df.columns = df.columns.str.strip()
+    df = pd.read_csv(base_file, low_memory=False)
+    df.columns = df.columns.str.strip()
 
-        df = df[[
-            "PCD",
-            "X_Latitude",
-            "Y_Longitude",
-            "Total_Persons",
-            "Occupied_Households",
-            "OAC_Subgroup_Name"
+    df = df[[
+        "pcd",
+        "lat",
+        "long",
+        "oac11"
+    ]].copy()
+
+    df = df.rename(columns={
+        "pcd": "postcode",
+        "long": "lon",
+        "oac11": "oac_subgroup_code"
+    })
+
+    df["postcode"] = df["postcode"].astype(str).str.strip().str.upper()
+    df["oac_subgroup_code"] = df["oac_subgroup_code"].astype(str).str.strip().str.upper()
+
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+
+    # -----------------------------
+    # Population source 1 - preferred
+    # postcode_population_2.csv
+    # -----------------------------
+    if population_file_1.exists():
+        print(f"Loading {population_file_1.name}")
+
+        pop = pd.read_csv(population_file_1, low_memory=False)
+        pop.columns = pop.columns.str.strip()
+
+        pop = pop[[
+            "Postcode",
+            "Total",
+            "Occupied_Households"
         ]].copy()
 
-        df = df.rename(columns={
-            "PCD": "postcode",
-            "Y_Longitude": "lat",
-            "X_Latitude": "lon",
-            "Total_Persons": "population",
-            "Occupied_Households": "households",
-            "OAC_Subgroup_Name": "area_type"
+        pop = pop.rename(columns={
+            "Postcode": "postcode",
+            "Total": "population",
+            "Occupied_Households": "households"
         })
 
-        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-        df["population"] = pd.to_numeric(df["population"], errors="coerce").fillna(0)
-        df["households"] = pd.to_numeric(df["households"], errors="coerce").fillna(0)
+        pop["postcode"] = pop["postcode"].astype(str).str.strip().str.upper()
+        pop["population"] = pd.to_numeric(pop["population"], errors="coerce").fillna(0)
+        pop["households"] = pd.to_numeric(pop["households"], errors="coerce").fillna(0)
 
-        dfs.append(df)
+        pop = pop.groupby("postcode", as_index=False).agg({
+            "population": "sum",
+            "households": "sum"
+        })
 
-    if not dfs:
-        raise FileNotFoundError(f"No CSV files found in {DATA_FOLDER}")
+    # -----------------------------
+    # Population source 2 - fallback
+    # postcode_population.csv
+    # -----------------------------
+    elif population_file_2.exists():
+        print(f"Loading {population_file_2.name}")
 
-    df = pd.concat(dfs, ignore_index=True)
+        pop_raw = pd.read_csv(population_file_2, low_memory=False)
+        pop_raw.columns = pop_raw.columns.str.strip()
 
+        pop_raw = pop_raw[[
+            "Postcode",
+            "Count"
+        ]].copy()
+
+        pop_raw = pop_raw.rename(columns={
+            "Postcode": "postcode",
+            "Count": "population"
+        })
+
+        pop_raw["postcode"] = pop_raw["postcode"].astype(str).str.strip().str.upper()
+        pop_raw["population"] = pd.to_numeric(pop_raw["population"], errors="coerce").fillna(0)
+
+        pop = pop_raw.groupby("postcode", as_index=False).agg({
+            "population": "sum"
+        })
+
+        pop["households"] = 0
+
+    else:
+        print("No population file found. Setting population and households to zero.")
+
+        pop = pd.DataFrame(columns=[
+            "postcode",
+            "population",
+            "households"
+        ])
+
+    df = df.merge(
+        pop,
+        on="postcode",
+        how="left"
+    )
+
+    df["population"] = pd.to_numeric(df["population"], errors="coerce").fillna(0)
+    df["households"] = pd.to_numeric(df["households"], errors="coerce").fillna(0)
+
+    # -----------------------------
+    # Demographic lookup
+    # -----------------------------
+    if demographic_file.exists():
+        print(f"Loading {demographic_file.name}")
+
+        demo = pd.read_csv(demographic_file, low_memory=False)
+        demo.columns = demo.columns.str.strip()
+
+        demo = demo[[
+            "OAC_Subgroup_Code",
+            "OAC_Goup_Name",
+            "OAC_Subgroup_Name",
+            "OAC_Supergroup_Name"
+        ]].copy()
+
+        demo = demo.rename(columns={
+            "OAC_Subgroup_Code": "oac_subgroup_code",
+            "OAC_Goup_Name": "oac_group_name",
+            "OAC_Subgroup_Name": "area_type",
+            "OAC_Supergroup_Name": "oac_supergroup_name"
+        })
+
+        demo["oac_subgroup_code"] = demo["oac_subgroup_code"].astype(str).str.strip().str.upper()
+
+        df = df.merge(
+            demo,
+            on="oac_subgroup_code",
+            how="left"
+        )
+
+    else:
+        print("No demographic lookup file found. Setting demographic fields to Other.")
+
+        df["oac_group_name"] = "Other"
+        df["area_type"] = "Other"
+        df["oac_supergroup_name"] = "Other"
+
+    df["oac_group_name"] = df["oac_group_name"].fillna("Other")
+    df["area_type"] = df["area_type"].fillna("Other")
+    df["oac_supergroup_name"] = df["oac_supergroup_name"].fillna("Other")
+
+    # Keep all postcodes where lat/lon is valid
     df = df.dropna(subset=["lat", "lon"])
-    df = df[df["lat"].between(49, 61) & df["lon"].between(-8, 2)]
-    df = df[df["population"] > 0]
+    df = df[
+        df["lat"].between(49, 61) &
+        df["lon"].between(-8, 2)
+    ]
 
-    print(f"Loaded {len(df):,} rows from {len(files)} files")
+    print(f"Loaded {len(df):,} postcodes")
+    print(f"Total population matched: {df['population'].sum():,.0f}")
+    print(f"Postcodes with population: {(df['population'] > 0).sum():,}")
+    print(f"Postcodes without population: {(df['population'] == 0).sum():,}")
 
     return df
 
