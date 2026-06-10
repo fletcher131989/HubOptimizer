@@ -1,3 +1,4 @@
+import base64
 import json
 
 import pandas as pd
@@ -180,7 +181,8 @@ def render_results(result, map_filename="user_polygon_result.html"):
     try:
         with open(map_filename, "r", encoding="utf-8") as f:
             map_html = f.read()
-        st.iframe(map_html, height=550, scrolling=False)
+        encoded = base64.b64encode(map_html.encode()).decode()
+        st.iframe(f"data:text/html;base64,{encoded}", height=550, scrolling=False)
     except FileNotFoundError:
         st.warning("Map file not found — it may not have been generated.")
 
