@@ -2,7 +2,6 @@ import json
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
@@ -181,7 +180,7 @@ def render_results(result, map_filename="user_polygon_result.html"):
     try:
         with open(map_filename, "r", encoding="utf-8") as f:
             map_html = f.read()
-        components.html(map_html, height=550, scrolling=False)
+        st.iframe(map_html, height=550, scrolling=False)
     except FileNotFoundError:
         st.warning("Map file not found — it may not have been generated.")
 
