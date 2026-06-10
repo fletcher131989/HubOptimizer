@@ -11,6 +11,7 @@ import folium
 DATA_FOLDER = Path("postcode_data")
 EARTH_RADIUS_KM = 6371.0
 KM_PER_MILE = 1.60934
+_PARQUET_COLS = ["postcode", "lat", "lon", "population", "households", "area_type"]
 HUB_COLORS = [
     "red", "blue", "green", "purple", "orange",
     "darkred", "cadetblue", "darkgreen", "darkpurple",
@@ -60,6 +61,21 @@ def convert_to_km(distance, unit):
         return distance * KM_PER_MILE
 
     raise ValueError("Unit must be 'km' or 'miles'")
+
+
+def _generate_grid_candidates(area_df, spacing_km):
+    """Return a float32 (N, 2) array of lat/lon grid points covering area_df's bounding box."""
+    min_lat = float(area_df["lat"].min())
+    max_lat = float(area_df["lat"].max())
+    min_lon = float(area_df["lon"].min())
+    max_lon = float(area_df["lon"].max())
+    mid_lat = (min_lat + max_lat) / 2.0
+    lat_step = spacing_km / 110.574
+    lon_step = spacing_km / (111.320 * np.cos(np.radians(mid_lat)))
+    lats = np.arange(min_lat, max_lat + lat_step, lat_step, dtype=np.float32)
+    lons = np.arange(min_lon, max_lon + lon_step, lon_step, dtype=np.float32)
+    grid_lats, grid_lons = np.meshgrid(lats, lons)
+    return np.column_stack([grid_lats.ravel(), grid_lons.ravel()])
 
 
 # --------------------------------------------------
@@ -253,8 +269,9 @@ def build_postcode_parquet_data(chunk_size=250_000):
 #     build_postcode_parquet_data()
 
 
-def load_postcode_data():
 
+#@st.cache_data(show_spinner=False)
+def load_postcode_data():
     parquet_folder = Path("postcode_parquet")
     files = sorted(parquet_folder.glob("*.parquet"))
 
@@ -264,27 +281,15 @@ def load_postcode_data():
             "Run build_postcode_parquet_data() locally first."
         )
 
-    dfs = []
-
-    for f in files:
-        print(f"Loading {f.name}")
-        dfs.append(pd.read_parquet(f))
-
-    df = pd.concat(dfs, ignore_index=True)
-
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    df["population"] = pd.to_numeric(df["population"], errors="coerce").fillna(0)
-    df["households"] = pd.to_numeric(df["households"], errors="coerce").fillna(0)
+    df = pd.concat(
+        [pd.read_parquet(f, columns=_PARQUET_COLS) for f in files],
+        ignore_index=True,
+    )
 
     df = df.dropna(subset=["lat", "lon"])
-    df = df[
-        df["lat"].between(49, 61) &
-        df["lon"].between(-8, 2)
-    ]
+    df = df[df["lat"].between(49, 61) & df["lon"].between(-8, 2)]
 
     print(f"Loaded {len(df):,} postcodes from {len(files)} parquet files")
-
     return df
 
 
@@ -487,7 +492,7 @@ def filter_polygon(df, boundary_points):
     bbox_df = df[
         df["lat"].between(min_lat, max_lat) &
         df["lon"].between(min_lon, max_lon)
-    ].copy()
+    ]
 
     print(f"Rows inside polygon bounding box: {len(bbox_df):,}")
 
@@ -553,10 +558,10 @@ def evaluate_fixed_hubs(df, hubs, hub_radius_km):
 
     hubs = validate_fixed_hubs(hubs)
 
-    demand_df = df.reset_index(drop=True).copy()
-    populations = demand_df["population"].to_numpy()
-    households = demand_df["households"].to_numpy()
-    demand_coords_rad = np.radians(demand_df[["lat", "lon"]].to_numpy())
+    demand_df = df.reset_index(drop=True)
+    populations = demand_df["population"].to_numpy(dtype=np.float32)
+    households = demand_df["households"].to_numpy(dtype=np.float32)
+    demand_coords_rad = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
 
     tree = BallTree(demand_coords_rad, metric="haversine")
     radius_rad = hub_radius_km / EARTH_RADIUS_KM
@@ -825,7 +830,7 @@ def run_hybrid_optimisation_polygon(
     num_free_hubs,
     hub_radius,
     radius_unit="km",
-    candidate_stride=5,
+    grid_spacing_km=1.0,
     map_filename="Hybrid_Hub_Map_Polygon.html",
 ):
     """
@@ -866,7 +871,7 @@ def run_hybrid_optimisation_polygon(
                 remaining_df,
                 num_free_hubs,
                 hub_radius_km,
-                candidate_stride=candidate_stride,
+                grid_spacing_km=grid_spacing_km,
                 jostle_radius_km=2.0,
                 refine_passes=3,
             )
@@ -1048,8 +1053,8 @@ def optimise_hubs_fast(df, num_hubs, hub_radius_km, candidate_stride=1):
     else:
         candidate_df = demand_df.copy()
 
-    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy())
-    candidate_coords = np.radians(candidate_df[["lat", "lon"]].to_numpy())
+    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
+    candidate_coords = np.radians(candidate_df[["lat", "lon"]].to_numpy(dtype=np.float32))
 
     tree = BallTree(demand_coords, metric="haversine")
     radius_rad = hub_radius_km / EARTH_RADIUS_KM
@@ -1057,8 +1062,8 @@ def optimise_hubs_fast(df, num_hubs, hub_radius_km, candidate_stride=1):
     print("Precomputing coverage...")
     neighbor_indices = tree.query_radius(candidate_coords, r=radius_rad)
 
-    populations = demand_df["population"].to_numpy()
-    households = demand_df["households"].to_numpy()
+    populations = demand_df["population"].to_numpy(dtype=np.float32)
+    households = demand_df["households"].to_numpy(dtype=np.float32)
 
     covered_mask = np.zeros(len(demand_df), dtype=bool)
     hubs = []
@@ -1113,7 +1118,7 @@ def optimise_hubs_fast_refined(
     df,
     num_hubs,
     hub_radius_km,
-    candidate_stride=1,
+    grid_spacing_km=1.0,
     jostle_radius_km=2.0,
     refine_passes=3,
     min_improvement_population=1.0
@@ -1121,15 +1126,12 @@ def optimise_hubs_fast_refined(
     if df.empty:
         raise ValueError("No postcode rows found inside the search area.")
 
-    demand_df = df.reset_index(drop=True).copy()
+    demand_df = df.reset_index(drop=True)
 
-    if candidate_stride > 1:
-        candidate_df = demand_df.iloc[::candidate_stride].reset_index(drop=True).copy()
-    else:
-        candidate_df = demand_df.copy()
+    candidate_latlons = _generate_grid_candidates(demand_df, grid_spacing_km)
 
-    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy())
-    candidate_coords = np.radians(candidate_df[["lat", "lon"]].to_numpy())
+    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
+    candidate_coords = np.radians(candidate_latlons)
 
     demand_tree = BallTree(demand_coords, metric="haversine")
     candidate_tree = BallTree(candidate_coords, metric="haversine")
@@ -1137,11 +1139,11 @@ def optimise_hubs_fast_refined(
     hub_radius_rad = hub_radius_km / EARTH_RADIUS_KM
     jostle_radius_rad = jostle_radius_km / EARTH_RADIUS_KM
 
-    print(f"Precomputing hub coverage for {len(candidate_df):,} candidate locations...")
+    print(f"Precomputing hub coverage for {len(candidate_latlons):,} grid candidates ({grid_spacing_km} km spacing)...")
     neighbor_indices = demand_tree.query_radius(candidate_coords, r=hub_radius_rad)
 
-    populations = demand_df["population"].to_numpy()
-    households = demand_df["households"].to_numpy()
+    populations = demand_df["population"].to_numpy(dtype=np.float32)
+    households = demand_df["households"].to_numpy(dtype=np.float32)
 
     # --- Stage 1: Greedy seed solution ---
 
@@ -1150,7 +1152,7 @@ def optimise_hubs_fast_refined(
 
     for hub_num in range(1, num_hubs + 1):
         best_idx = None
-        best_gain = -1
+        best_gain = -1.0
         best_cover = None
 
         print(f"Selecting hub {hub_num} (greedy seed)...")
@@ -1183,9 +1185,10 @@ def optimise_hubs_fast_refined(
         hubs = []
 
         for hub_num, candidate_idx in enumerate(selected_indices, start=1):
-            hub_row = candidate_df.iloc[candidate_idx]
+            hub_lat = float(candidate_latlons[candidate_idx][0])
+            hub_lon = float(candidate_latlons[candidate_idx][1])
             full_cover = neighbor_indices[candidate_idx]
-            hub_postcode = find_nearest_postcode(hub_row["lat"], hub_row["lon"], demand_df)
+            hub_postcode = find_nearest_postcode(hub_lat, hub_lon, demand_df)
 
             other_indices = [idx for i, idx in enumerate(selected_indices) if (i + 1) != hub_num]
             others_mask = np.zeros(len(demand_df), dtype=bool)
@@ -1208,8 +1211,8 @@ def optimise_hubs_fast_refined(
             hubs.append({
                 "hub_number": hub_num,
                 "hub_postcode": hub_postcode,
-                "lat": float(hub_row["lat"]),
-                "lon": float(hub_row["lon"]),
+                "lat": hub_lat,
+                "lon": hub_lon,
                 "postcodes": int(len(net_new_cover)),
                 "population": float(net_population),
                 "households": float(net_households),
@@ -1306,7 +1309,7 @@ def run_hub_optimisation(
     city_radius,
     radius_unit="km",
     use_optimized=True,
-    candidate_stride=5,
+    grid_spacing_km=1.0,
     create_map_output=True
 ):
     hub_radius_km = convert_to_km(hub_radius, radius_unit)
@@ -1321,7 +1324,7 @@ def run_hub_optimisation(
             city_df,
             num_hubs,
             hub_radius_km,
-            candidate_stride=candidate_stride,
+            grid_spacing_km=grid_spacing_km,
             jostle_radius_km=3.0,
             refine_passes=5
         )
@@ -1359,7 +1362,7 @@ def run_hub_optimisation_polygon(
     hub_radius,
     radius_unit="km",
     use_optimized=True,
-    candidate_stride=5,
+    grid_spacing_km=1.0,
     create_map_output=True,
     map_filename="Hub_Map_Polygon.html"
 ):
@@ -1380,7 +1383,7 @@ def run_hub_optimisation_polygon(
             area_df,
             num_hubs,
             hub_radius_km,
-            candidate_stride=candidate_stride,
+            grid_spacing_km=grid_spacing_km,
             jostle_radius_km=2.0,
             refine_passes=3
         )
@@ -1453,11 +1456,12 @@ def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit
         empty = pd.DataFrame(columns=cols)
         return empty, empty.copy()
 
-    pc_lats = area_df["lat"].to_numpy()
-    pc_lons = area_df["lon"].to_numpy()
+    pc_lats = area_df["lat"].to_numpy(dtype=np.float32)
+    pc_lons = area_df["lon"].to_numpy(dtype=np.float32)
+    use_miles = radius_unit.lower() in ("mile", "miles", "mi")
 
-    multi_rows = []
-    # idx -> (dist_km, hub_number, hub_name, dist_display)
+    multi_dfs = []
+    # df_idx -> (dist_km, hub_number, hub_name, dist_display)
     best: dict[int, tuple] = {}
 
     for hub in hub_results:
@@ -1467,52 +1471,54 @@ def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit
         hub_number = hub["hub_number"]
 
         dists_km = haversine_array(hub_lat, hub_lon, pc_lats, pc_lons)
-        dists_display = dists_km / KM_PER_MILE if radius_unit.lower() in ("mile", "miles", "mi") else dists_km
+        in_range = np.where(dists_km <= hub_radius_km)[0]
 
-        for idx in np.where(dists_km <= hub_radius_km)[0]:
-            row   = area_df.iloc[idx]
-            d_km  = float(dists_km[idx])
-            d_dis = float(dists_display[idx])
+        if len(in_range) == 0:
+            continue
 
-            multi_rows.append({
-                "Postcode":   row["postcode"],
-                "Lat":        round(float(row["lat"]), 5),
-                "Lon":        round(float(row["lon"]), 5),
-                "Hub":        hub_name,
-                "Hub Number": hub_number,
-                dist_col:     round(d_dis, 4),
-            })
+        dists_display = dists_km[in_range] / KM_PER_MILE if use_miles else dists_km[in_range]
 
-            # nearest-hub logic: lower distance wins; tie → lower hub_number
-            prev = best.get(idx)
+        batch = area_df.iloc[in_range][["postcode", "lat", "lon"]].copy()
+        batch.columns = ["Postcode", "Lat", "Lon"]
+        batch["Lat"] = batch["Lat"].round(5)
+        batch["Lon"] = batch["Lon"].round(5)
+        batch["Hub"] = hub_name
+        batch["Hub Number"] = hub_number
+        batch[dist_col] = np.round(dists_display, 4)
+        multi_dfs.append(batch[cols])
+
+        # nearest-hub tracking
+        for arr_pos, df_idx in enumerate(in_range):
+            d_km  = float(dists_km[df_idx])
+            d_dis = float(dists_display[arr_pos])
+            prev  = best.get(df_idx)
             if prev is None or d_km < prev[0] or (d_km == prev[0] and hub_number < prev[1]):
-                best[idx] = (d_km, hub_number, hub_name, d_dis)
+                best[df_idx] = (d_km, hub_number, hub_name, d_dis)
 
     multi_df = (
-        pd.DataFrame(multi_rows, columns=cols)
+        pd.concat(multi_dfs, ignore_index=True)
         .sort_values(["Hub Number", "Postcode"])
         .reset_index(drop=True)
-        if multi_rows else pd.DataFrame(columns=cols)
+        if multi_dfs else pd.DataFrame(columns=cols)
     )
 
-    single_rows = [
-        {
-            "Postcode":   area_df.iloc[idx]["postcode"],
-            "Lat":        round(float(area_df.iloc[idx]["lat"]), 5),
-            "Lon":        round(float(area_df.iloc[idx]["lon"]), 5),
-            "Hub":        hub_name,
-            "Hub Number": hub_number,
-            dist_col:     round(d_dis, 4),
-        }
-        for idx, (_, hub_number, hub_name, d_dis) in best.items()
-    ]
-
-    single_df = (
-        pd.DataFrame(single_rows, columns=cols)
-        .sort_values(["Hub Number", "Postcode"])
-        .reset_index(drop=True)
-        if single_rows else pd.DataFrame(columns=cols)
-    )
+    if best:
+        best_indices = list(best.keys())
+        best_vals    = list(best.values())
+        single_df = area_df.iloc[best_indices][["postcode", "lat", "lon"]].copy()
+        single_df.columns = ["Postcode", "Lat", "Lon"]
+        single_df["Lat"]        = single_df["Lat"].round(5)
+        single_df["Lon"]        = single_df["Lon"].round(5)
+        single_df["Hub Number"] = [v[1] for v in best_vals]
+        single_df["Hub"]        = [v[2] for v in best_vals]
+        single_df[dist_col]     = [round(v[3], 4) for v in best_vals]
+        single_df = (
+            single_df[cols]
+            .sort_values(["Hub Number", "Postcode"])
+            .reset_index(drop=True)
+        )
+    else:
+        single_df = pd.DataFrame(columns=cols)
 
     return multi_df, single_df
 
@@ -1547,7 +1553,7 @@ if __name__ == "__main__":
             hub_radius=5,
             radius_unit="miles",
             use_optimized=True,
-            candidate_stride=5,
+            grid_spacing_km=1.0,
             create_map_output=True,
             map_filename="London-M25-20_hubs-5_mile_radius.html"
         )
@@ -1583,6 +1589,6 @@ if __name__ == "__main__":
             city_radius=10,
             radius_unit="miles",
             use_optimized=True,
-            candidate_stride=10,
+            grid_spacing_km=1.0,
             create_map_output=True
         )

@@ -201,9 +201,13 @@ st.sidebar.header("Optimization Settings")
 num_hubs = st.sidebar.number_input("Total number of hubs", min_value=1, max_value=50, value=4)
 hub_radius = st.sidebar.number_input("Hub radius", min_value=0.1, value=5.0)
 radius_unit = st.sidebar.selectbox("Radius unit", ["miles", "km"], index=0)
-candidate_stride = st.sidebar.number_input(
-    "Candidate stride", min_value=1, max_value=50, value=5,
-    help="Higher = faster but less precise. 1 = exhaustive.",
+grid_spacing_km = st.sidebar.number_input(
+    "Grid spacing (km)",
+    min_value=0.25,
+    max_value=5.0,
+    value=1.0,
+    step=0.25,
+    help="Distance between candidate hub locations. Larger = faster and less memory. 1 km is a good default.",
 )
 
 # --------------------------------------------------
@@ -309,7 +313,7 @@ else:
                         num_free_hubs=num_free,
                         hub_radius=hub_radius,
                         radius_unit=radius_unit,
-                        candidate_stride=int(candidate_stride),
+                        grid_spacing_km=float(grid_spacing_km),
                         map_filename="user_polygon_result.html",
                     )
                 elif fixed_hubs_input and num_free == 0:
@@ -328,7 +332,7 @@ else:
                         hub_radius=hub_radius,
                         radius_unit=radius_unit,
                         use_optimized=True,
-                        candidate_stride=int(candidate_stride),
+                        grid_spacing_km=float(grid_spacing_km),
                         create_map_output=True,
                         map_filename="user_polygon_result.html",
                     )
