@@ -182,7 +182,7 @@ def render_results(result, map_filename="user_polygon_result.html"):
         with open(map_filename, "r", encoding="utf-8") as f:
             map_html = f.read()
         encoded = base64.b64encode(map_html.encode()).decode()
-        st.iframe(f"data:text/html;base64,{encoded}", height=550, scrolling=False)
+        st.iframe(f"data:text/html;base64,{encoded}", height=550)
     except FileNotFoundError:
         st.warning("Map file not found — it may not have been generated.")
 
