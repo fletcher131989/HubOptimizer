@@ -261,7 +261,7 @@ Draw(
 ).add_to(base_map)
 
 st.write("Draw a polygon or rectangle on the map to define your search area.")
-map_data = st_folium(base_map, width=1000, height=600)
+map_data = st_folium(base_map, width=1000, height=600, key=f"map_{st.session_state.get('map_key', 0)}")
 
 # --------------------------------------------------
 # Extract geometry — no st.stop() used here
@@ -340,6 +340,9 @@ else:
                 overlay.empty()
                 # Persist results so they survive Streamlit reruns
                 st.session_state["result"] = result
+                # Reset map key to force a fresh map render (clears drawn area)
+                st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
+                st.rerun()
             except Exception as e:
                 overlay.empty()
                 st.error(str(e))
