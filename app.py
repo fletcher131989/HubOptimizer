@@ -293,18 +293,27 @@ else:
             st.code(json.dumps(preview, indent=2), language="json")
 
         num_free = int(num_hubs) - len(fixed_hubs_input)
-        run_label = (
-            f"🚀 Run Optimization  ({len(fixed_hubs_input)} fixed · {num_free} optimized)"
-            if fixed_hubs_input else "🚀 Run Optimization"
-        )
+        if not fixed_hubs_input:
+            run_label = "🚀 Run Optimization"
+        elif num_free == 0:
+            run_label = f"🗺️ Compute Coverage  ({len(fixed_hubs_input)} fixed hub{'s' if len(fixed_hubs_input) != 1 else ''})"
+        else:
+            run_label = f"🚀 Run Optimization  ({len(fixed_hubs_input)} fixed · {num_free} optimized)"
 
         if st.button(run_label, type="primary"):
             overlay = st.empty()
-            show_overlay(
-                overlay,
-                message="Optimizing…",
-                subtext=f"Placing {int(num_hubs)} hub(s) across {n_pts} boundary points.",
-            )
+            if fixed_hubs_input and num_free == 0:
+                show_overlay(
+                    overlay,
+                    message="Computing coverage…",
+                    subtext=f"Evaluating {len(fixed_hubs_input)} fixed hub(s) across {n_pts} boundary points.",
+                )
+            else:
+                show_overlay(
+                    overlay,
+                    message="Optimizing…",
+                    subtext=f"Placing {int(num_hubs)} hub(s) across {n_pts} boundary points.",
+                )
 
             try:
                 if fixed_hubs_input and num_free > 0:
@@ -347,5 +356,5 @@ else:
                 overlay.empty()
                 st.error(str(e))
 
-        if "result" in st.session_state:
-            render_results(st.session_state["result"])
+if "result" in st.session_state:
+    render_results(st.session_state["result"])
