@@ -1298,6 +1298,268 @@ def optimise_hubs_fast_refined(
 
 
 # --------------------------------------------------
+# COVERAGE-TARGET OPTIMISER
+# --------------------------------------------------
+
+def optimise_hubs_by_coverage(
+    df,
+    target_coverage_pct,
+    hub_radius_km,
+    max_hubs=50,
+    grid_spacing_km=1.0,
+    jostle_radius_km=2.0,
+    refine_passes=3,
+    min_improvement_population=1.0,
+):
+    if df.empty:
+        raise ValueError("No postcode rows found inside the search area.")
+
+    demand_df = df.reset_index(drop=True)
+    total_population = float(demand_df["population"].sum())
+
+    if total_population == 0:
+        raise ValueError("Total population in area is zero.")
+
+    target_population = total_population * target_coverage_pct / 100.0
+
+    candidate_latlons = _generate_grid_candidates(demand_df, grid_spacing_km)
+
+    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
+    candidate_coords = np.radians(candidate_latlons)
+
+    demand_tree = BallTree(demand_coords, metric="haversine")
+    candidate_tree = BallTree(candidate_coords, metric="haversine")
+
+    hub_radius_rad = hub_radius_km / EARTH_RADIUS_KM
+    jostle_radius_rad = jostle_radius_km / EARTH_RADIUS_KM
+
+    print(f"Precomputing hub coverage for {len(candidate_latlons):,} grid candidates ({grid_spacing_km} km spacing)...")
+    neighbor_indices = demand_tree.query_radius(candidate_coords, r=hub_radius_rad)
+
+    populations = demand_df["population"].to_numpy(dtype=np.float32)
+    households = demand_df["households"].to_numpy(dtype=np.float32)
+
+    # --- Stage 1: Greedy seed until target coverage reached ---
+    covered_mask = np.zeros(len(demand_df), dtype=bool)
+    selected_candidate_indices = []
+
+    for hub_num in range(1, max_hubs + 1):
+        best_idx = None
+        best_gain = -1.0
+        best_cover = None
+
+        print(f"Selecting hub {hub_num} (greedy seed)...")
+
+        for idx, cover in enumerate(neighbor_indices):
+            uncovered = cover[~covered_mask[cover]]
+            gain = populations[uncovered].sum()
+            if gain > best_gain:
+                best_gain = gain
+                best_idx = idx
+                best_cover = uncovered
+
+        if best_idx is None or best_cover is None or len(best_cover) == 0:
+            print(f"No further useful hub placement found after {hub_num - 1} hub(s).")
+            break
+
+        selected_candidate_indices.append(best_idx)
+        covered_mask[best_cover] = True
+
+        covered_pop = float(populations[covered_mask].sum())
+        pct_achieved = 100.0 * covered_pop / total_population
+        print(f"Placed seed hub {hub_num}: {populations[best_cover].sum():,.0f} population | Coverage: {pct_achieved:.1f}%")
+
+        if covered_pop >= target_population:
+            print(f"Target coverage of {target_coverage_pct:.1f}% reached with {hub_num} hub(s).")
+            break
+
+    if not selected_candidate_indices:
+        return [], set()
+
+    # --- Helper: summarize chosen hubs ---
+    def summarize_selection(selected_indices):
+        overall_mask = np.zeros(len(demand_df), dtype=bool)
+        hubs = []
+
+        for h_num, candidate_idx in enumerate(selected_indices, start=1):
+            hub_lat = float(candidate_latlons[candidate_idx][0])
+            hub_lon = float(candidate_latlons[candidate_idx][1])
+            full_cover = neighbor_indices[candidate_idx]
+            hub_postcode = find_nearest_postcode(hub_lat, hub_lon, demand_df)
+
+            other_indices = [idx for i, idx in enumerate(selected_indices) if (i + 1) != h_num]
+            others_mask = np.zeros(len(demand_df), dtype=bool)
+            for other_idx in other_indices:
+                others_mask[neighbor_indices[other_idx]] = True
+
+            net_new_cover = full_cover[~others_mask[full_cover]]
+            covered_df = demand_df.iloc[net_new_cover]
+
+            potential_population = float(populations[full_cover].sum())
+            net_population = float(populations[net_new_cover].sum())
+            potential_households = float(households[full_cover].sum())
+            net_households = float(households[net_new_cover].sum())
+
+            overlap_population = potential_population - net_population
+            overlap_households = potential_households - net_households
+
+            overall_mask[full_cover] = True
+
+            hubs.append({
+                "hub_number": h_num,
+                "hub_postcode": hub_postcode,
+                "lat": hub_lat,
+                "lon": hub_lon,
+                "postcodes": int(len(net_new_cover)),
+                "population": float(net_population),
+                "households": float(net_households),
+                "potential_postcodes": int(len(full_cover)),
+                "potential_population": float(potential_population),
+                "potential_households": float(potential_households),
+                "overlap_population": float(overlap_population),
+                "overlap_households": float(overlap_households),
+                "top_area_types": covered_df["area_type"].value_counts().head(5).to_dict(),
+            })
+
+        covered_postcodes = set(demand_df.loc[overall_mask, "postcode"])
+        return hubs, covered_postcodes
+
+    # --- Helper: total unique covered population ---
+    def total_unique_population(selected_indices):
+        mask = np.zeros(len(demand_df), dtype=bool)
+        for idx in selected_indices:
+            mask[neighbor_indices[idx]] = True
+        return float(populations[mask].sum())
+
+    # --- Stage 2: Local refinement / jostling ---
+    current_total = total_unique_population(selected_candidate_indices)
+    print(f"\nInitial greedy unique covered population: {current_total:,.0f}")
+
+    for refine_pass in range(1, refine_passes + 1):
+        improved_this_pass = False
+        print(f"\nRefinement pass {refine_pass}/{refine_passes}...")
+
+        for hub_pos in range(len(selected_candidate_indices)):
+            current_idx = selected_candidate_indices[hub_pos]
+
+            others_mask = np.zeros(len(demand_df), dtype=bool)
+            for j, idx in enumerate(selected_candidate_indices):
+                if j != hub_pos:
+                    others_mask[neighbor_indices[idx]] = True
+
+            current_net_cover = neighbor_indices[current_idx][~others_mask[neighbor_indices[current_idx]]]
+            current_net_gain = float(populations[current_net_cover].sum())
+
+            nearby_candidate_indices = candidate_tree.query_radius(
+                candidate_coords[current_idx:current_idx + 1],
+                r=jostle_radius_rad,
+            )[0]
+
+            best_local_idx = current_idx
+            best_local_gain = current_net_gain
+
+            for candidate_idx in nearby_candidate_indices:
+                candidate_net_cover = neighbor_indices[candidate_idx][~others_mask[neighbor_indices[candidate_idx]]]
+                candidate_net_gain = float(populations[candidate_net_cover].sum())
+
+                if candidate_net_gain > best_local_gain + min_improvement_population:
+                    best_local_gain = candidate_net_gain
+                    best_local_idx = candidate_idx
+
+            if best_local_idx != current_idx:
+                trial_selection = selected_candidate_indices.copy()
+                trial_selection[hub_pos] = best_local_idx
+                trial_total = total_unique_population(trial_selection)
+
+                if trial_total > current_total + min_improvement_population:
+                    print(
+                        f"Hub {hub_pos + 1} moved: "
+                        f"{current_total:,.0f} -> {trial_total:,.0f} "
+                        f"(+{trial_total - current_total:,.0f})"
+                    )
+                    selected_candidate_indices = trial_selection
+                    current_total = trial_total
+                    improved_this_pass = True
+
+        if not improved_this_pass:
+            print("No improvements found in this pass.")
+            break
+
+    print(f"\nFinal refined unique covered population: {current_total:,.0f}")
+
+    hubs, covered_postcodes = summarize_selection(selected_candidate_indices)
+    return hubs, covered_postcodes
+
+
+def run_hub_optimisation_polygon_by_coverage(
+    boundary_points,
+    target_coverage_pct,
+    hub_radius,
+    radius_unit="km",
+    max_hubs=50,
+    grid_spacing_km=1.0,
+    create_map_output=True,
+    map_filename="Hub_Map_Polygon_Coverage.html",
+):
+    hub_radius_km = convert_to_km(hub_radius, radius_unit)
+
+    df = load_postcode_data()
+
+    area_df, cleaned_polygon = filter_polygon(df, boundary_points)
+
+    if area_df.empty:
+        raise ValueError(
+            "No postcode data found inside the polygon boundary. "
+            "Check that the points are in the right order and cover a sensible area."
+        )
+
+    hubs, covered = optimise_hubs_by_coverage(
+        area_df,
+        target_coverage_pct=target_coverage_pct,
+        hub_radius_km=hub_radius_km,
+        max_hubs=max_hubs,
+        grid_spacing_km=grid_spacing_km,
+        jostle_radius_km=2.0,
+        refine_passes=3,
+    )
+
+    total_population = area_df["population"].sum()
+    covered_population = area_df.loc[
+        area_df["postcode"].isin(covered), "population"
+    ].sum()
+
+    coverage_pct = 0 if total_population == 0 else 100 * covered_population / total_population
+
+    print_hub_results(hubs, covered_population, total_population, coverage_pct, "COVERAGE TARGET RESULTS")
+
+    if create_map_output:
+        create_hub_map(
+            hub_radius_km=hub_radius_km,
+            hubs=hubs,
+            unit=radius_unit,
+            output_file=map_filename,
+            boundary_points=cleaned_polygon,
+        )
+
+    multi_df, single_df = build_postcode_hub_mappings(
+        area_df, hubs, hub_radius_km, radius_unit
+    )
+
+    return {
+        "hubs": hubs,
+        "covered_postcodes": covered,
+        "total_population": float(total_population),
+        "covered_population": float(covered_population),
+        "coverage_pct": float(coverage_pct),
+        "target_coverage_pct": target_coverage_pct,
+        "boundary_points": cleaned_polygon,
+        "radius_unit": radius_unit,
+        "multi_hub_df": multi_df,
+        "single_hub_df": single_df,
+    }
+
+
+# --------------------------------------------------
 # RUNNER
 # --------------------------------------------------
 

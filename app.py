@@ -11,6 +11,7 @@ from main import (
     run_hub_optimisation_polygon,
     run_fixed_hub_coverage_polygon,
     run_hybrid_optimisation_polygon,
+    run_hub_optimisation_polygon_by_coverage,
 )
 
 
@@ -133,10 +134,22 @@ def render_results(result, map_filename="user_polygon_result.html"):
     st.markdown("---")
     st.subheader("Results")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Population (area)", f"{result['total_population']:,.0f}")
-    c2.metric("Covered Population",      f"{result['covered_population']:,.0f}")
-    c3.metric("Coverage",                f"{result['coverage_pct']:.1f}%")
+    target = result.get("target_coverage_pct")
+    n_hubs = len(result["hubs"])
+
+    if target is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Population (area)", f"{result['total_population']:,.0f}")
+        c2.metric("Covered Population",      f"{result['covered_population']:,.0f}")
+        c3.metric("Coverage Achieved",       f"{result['coverage_pct']:.1f}%",
+                  delta=f"{result['coverage_pct'] - target:+.1f}% vs {target:.0f}% target")
+        c4.metric("Hubs Required",           str(n_hubs))
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Population (area)", f"{result['total_population']:,.0f}")
+        c2.metric("Covered Population",      f"{result['covered_population']:,.0f}")
+        c3.metric("Coverage",                f"{result['coverage_pct']:.1f}%")
+        c4.metric("Hubs Placed",             str(n_hubs))
 
     # ← NEW: top-level download buttons
     multi_df  = result.get("multi_hub_df",  pd.DataFrame())
@@ -199,7 +212,33 @@ st.title("Hub Optimizer")
 # --------------------------------------------------
 
 st.sidebar.header("Optimization Settings")
-num_hubs = st.sidebar.number_input("Total number of hubs", min_value=1, max_value=50, value=4)
+
+opt_mode = st.sidebar.radio(
+    "Optimization mode",
+    ["Number of hubs", "Target coverage %"],
+    index=0,
+    help="Specify the number of hubs directly, or let the optimizer find how many are needed to hit a coverage target.",
+)
+
+if opt_mode == "Number of hubs":
+    num_hubs = st.sidebar.number_input("Total number of hubs", min_value=1, max_value=50, value=4)
+else:
+    target_coverage = st.sidebar.slider(
+        "Target coverage (%)",
+        min_value=10,
+        max_value=99,
+        value=80,
+        step=1,
+        help="The optimizer will keep adding hubs until this population coverage percentage is reached.",
+    )
+    max_hubs = st.sidebar.number_input(
+        "Max hubs cap",
+        min_value=1,
+        max_value=100,
+        value=20,
+        help="Safety limit — optimization stops here even if the target coverage has not been reached.",
+    )
+
 hub_radius = st.sidebar.number_input("Hub radius", min_value=0.1, value=5.0)
 radius_unit = st.sidebar.selectbox("Radius unit", ["miles", "km"], index=0)
 grid_spacing_km = st.sidebar.number_input(
@@ -212,36 +251,38 @@ grid_spacing_km = st.sidebar.number_input(
 )
 
 # --------------------------------------------------
-# Sidebar — fixed hubs
+# Sidebar — fixed hubs (number of hubs mode only)
 # --------------------------------------------------
 
-st.sidebar.markdown("---")
-st.sidebar.header("Fixed Hubs (optional)")
-
-max_fixed = int(num_hubs)
-num_fixed = int(st.sidebar.number_input(
-    "Number of fixed hubs",
-    min_value=0,
-    max_value=max_fixed,
-    value=0,
-    help=f"Pin up to {max_fixed} location(s). Remaining hubs will be optimized automatically.",
-))
-
 fixed_hubs_input = []
-for i in range(num_fixed):
-    st.sidebar.markdown(f"**Fixed Hub {i + 1}**")
-    name = st.sidebar.text_input("Name", key=f"fh_name_{i}", value=f"Fixed Hub {i + 1}")
-    col_a, col_b = st.sidebar.columns(2)
-    lat = col_a.number_input("Lat", key=f"fh_lat_{i}", value=52.4800, format="%.5f", step=0.001)
-    lon = col_b.number_input("Lon", key=f"fh_lon_{i}", value=-1.8900, format="%.5f", step=0.001)
-    fixed_hubs_input.append((name.strip(), float(lat), float(lon)))
 
-if num_fixed > 0:
-    num_free = int(num_hubs) - num_fixed
-    if num_free > 0:
-        st.sidebar.caption(f"↳ {num_free} hub(s) will be optimized automatically.")
-    else:
-        st.sidebar.caption("↳ All hubs are fixed — no optimization will run.")
+if opt_mode == "Number of hubs":
+    st.sidebar.markdown("---")
+    st.sidebar.header("Fixed Hubs (optional)")
+
+    max_fixed = int(num_hubs)
+    num_fixed = int(st.sidebar.number_input(
+        "Number of fixed hubs",
+        min_value=0,
+        max_value=max_fixed,
+        value=0,
+        help=f"Pin up to {max_fixed} location(s). Remaining hubs will be optimized automatically.",
+    ))
+
+    for i in range(num_fixed):
+        st.sidebar.markdown(f"**Fixed Hub {i + 1}**")
+        name = st.sidebar.text_input("Name", key=f"fh_name_{i}", value=f"Fixed Hub {i + 1}")
+        col_a, col_b = st.sidebar.columns(2)
+        lat = col_a.number_input("Lat", key=f"fh_lat_{i}", value=52.4800, format="%.5f", step=0.001)
+        lon = col_b.number_input("Lon", key=f"fh_lon_{i}", value=-1.8900, format="%.5f", step=0.001)
+        fixed_hubs_input.append((name.strip(), float(lat), float(lon)))
+
+    if num_fixed > 0:
+        num_free = int(num_hubs) - num_fixed
+        if num_free > 0:
+            st.sidebar.caption(f"↳ {num_free} hub(s) will be optimized automatically.")
+        else:
+            st.sidebar.caption("↳ All hubs are fixed — no optimization will run.")
 
 # --------------------------------------------------
 # Map
@@ -292,17 +333,27 @@ else:
             )
             st.code(json.dumps(preview, indent=2), language="json")
 
-        num_free = int(num_hubs) - len(fixed_hubs_input)
-        if not fixed_hubs_input:
-            run_label = "🚀 Run Optimization"
-        elif num_free == 0:
-            run_label = f"🗺️ Compute Coverage  ({len(fixed_hubs_input)} fixed hub{'s' if len(fixed_hubs_input) != 1 else ''})"
+        if opt_mode == "Number of hubs":
+            num_free = int(num_hubs) - len(fixed_hubs_input)
+            if not fixed_hubs_input:
+                run_label = "🚀 Run Optimization"
+            elif num_free == 0:
+                run_label = f"🗺️ Compute Coverage  ({len(fixed_hubs_input)} fixed hub{'s' if len(fixed_hubs_input) != 1 else ''})"
+            else:
+                run_label = f"🚀 Run Optimization  ({len(fixed_hubs_input)} fixed · {num_free} optimized)"
         else:
-            run_label = f"🚀 Run Optimization  ({len(fixed_hubs_input)} fixed · {num_free} optimized)"
+            run_label = f"🚀 Find Hubs for {target_coverage}% Coverage"
 
         if st.button(run_label, type="primary"):
             overlay = st.empty()
-            if fixed_hubs_input and num_free == 0:
+
+            if opt_mode == "Target coverage %":
+                show_overlay(
+                    overlay,
+                    message=f"Finding hubs for {target_coverage}% coverage…",
+                    subtext=f"Adding hubs until {target_coverage}% of the population is covered (max {int(max_hubs)}).",
+                )
+            elif fixed_hubs_input and num_free == 0:
                 show_overlay(
                     overlay,
                     message="Computing coverage…",
@@ -316,7 +367,18 @@ else:
                 )
 
             try:
-                if fixed_hubs_input and num_free > 0:
+                if opt_mode == "Target coverage %":
+                    result = run_hub_optimisation_polygon_by_coverage(
+                        boundary_points=boundary_points,
+                        target_coverage_pct=float(target_coverage),
+                        hub_radius=hub_radius,
+                        radius_unit=radius_unit,
+                        max_hubs=int(max_hubs),
+                        grid_spacing_km=float(grid_spacing_km),
+                        create_map_output=True,
+                        map_filename="user_polygon_result.html",
+                    )
+                elif fixed_hubs_input and num_free > 0:
                     result = run_hybrid_optimisation_polygon(
                         boundary_points=boundary_points,
                         fixed_hubs=fixed_hubs_input,
@@ -347,9 +409,7 @@ else:
                         map_filename="user_polygon_result.html",
                     )
                 overlay.empty()
-                # Persist results so they survive Streamlit reruns
                 st.session_state["result"] = result
-                # Reset map key to force a fresh map render (clears drawn area)
                 st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
                 st.rerun()
             except Exception as e:

@@ -4,7 +4,9 @@
       "Bash(.venv/Scripts/python:*)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(python *)",
+      "Bash(.venv/Scripts/streamlit run *)"
     ]
   }
 }
