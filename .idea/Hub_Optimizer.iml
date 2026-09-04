@@ -3,13 +3,8 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
-      <excludeFolder url="file://$MODULE_DIR$/Hub Map Archive" />
-      <excludeFolder url="file://$MODULE_DIR$/postcode_data" />
-      <excludeFolder url="file://$MODULE_DIR$/.claude" />
-      <excludeFolder url="file://$MODULE_DIR$/boundary_files" />
-      <excludeFolder url="file://$MODULE_DIR$/OLD POSTCODE DATA" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.13 (Hub_Optimizer)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="~\PycharmProjects\Hub_Optimizer\.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>
