@@ -1,0 +1,37 @@
+﻿Airport,IATA,Latitude,Longitude,Passenger importance,Freight importance
+London Heathrow Airport,LHR,51.47,-0.454,Major,Major
+London Gatwick Airport,LGW,51.154,-0.182,Major,Major
+Manchester Airport,MAN,53.354,-2.275,Major,Major
+London Stansted Airport,STN,51.885,0.235,Major,Major
+London Luton Airport,LTN,51.875,-0.368,Major,Major
+Edinburgh Airport,EDI,55.95,-3.373,Major,Major
+Birmingham Airport,BHX,52.454,-1.748,Major,Major
+Bristol Airport,BRS,51.383,-2.719,Major,Limited
+Glasgow Airport,GLA,55.872,-4.433,Major,Regional
+Belfast International Airport,BFS,54.658,-6.216,Major,Major
+Liverpool John Lennon Airport,LPL,53.334,-2.85,Major,Limited
+Newcastle International Airport,NCL,55.038,-1.692,Major,Regional
+Leeds Bradford Airport,LBA,53.866,-1.661,Major,Limited
+East Midlands Airport,EMA,52.831,-1.328,Major,Major
+London City Airport,LCY,51.505,0.055,Major,Limited
+George Best Belfast City Airport,BHD,54.618,-5.873,Major,Limited
+Aberdeen International Airport,ABZ,57.202,-2.198,Major,Regional
+Bournemouth Airport,BOH,50.78,-1.843,Major,Major
+Cardiff Airport,CWL,51.397,-3.343,Regional,Regional
+Southampton Airport,SOU,50.95,-1.357,Regional,Limited
+Inverness Airport,INV,57.543,-4.048,Regional,Limited
+London Southend Airport,SEN,51.571,0.696,Regional,Limited
+Glasgow Prestwick Airport,PIK,55.509,-4.587,Regional,Major
+Exeter Airport,EXT,50.734,-3.414,Regional,Limited
+Norwich Airport,NWI,52.676,1.283,Regional,Limited
+Cornwall Airport Newquay,NQY,50.441,-4.995,Regional,Limited
+Sumburgh Airport,LSI,59.879,-1.296,Regional,Limited
+Teesside International Airport,MME,54.509,-1.429,Regional,Regional
+City of Derry Airport,LDY,55.043,-7.161,Regional,Limited
+Humberside Airport,HUY,53.574,-0.351,Regional,Limited
+Kirkwall Airport,KOI,58.958,-2.905,Regional,Limited
+Stornoway Airport,SYY,58.216,-6.331,Regional,Limited
+"St Mary’s Airport, Isles of Scilly",ISC,49.913,-6.292,Regional,Limited
+Land’s End Airport,LEQ,50.103,-5.671,Regional,Limited
+Farnborough Airport,FAB,51.276,-0.776,Specialist/business,Limited
+Dundee Airport,DND,56.453,-3.026,Regional,Limited

@@ -4,3 +4,5 @@ OLD POSTCODE DATA/
 .claude
 Hub Map Archive
 postcode_data/
+__pycache__/
+.venv/

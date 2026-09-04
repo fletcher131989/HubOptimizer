@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from sklearn.neighbors import BallTree
 import folium
+from folium.plugins import HeatMap
 
 DATA_FOLDER = Path("postcode_data")
 EARTH_RADIUS_KM = 6371.0
@@ -24,7 +25,7 @@ HUB_COLORS = [
 # Distance calculations
 # --------------------------------------------------
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=200_000)
 def haversine(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
 
@@ -1784,6 +1785,417 @@ def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit
 
     return multi_df, single_df
 
+
+
+# --------------------------------------------------
+# Cross-border (airport catchment) optimisation
+# --------------------------------------------------
+
+AIRPORTS_CSV = Path("Airports.csv")
+
+
+def load_uk_airports():
+    """
+    Load UK airport reference data from Airports.csv:
+    name, IATA code, lat/lon, and passenger/freight importance
+    ("Major" / "Regional" / "Limited" / "Specialist/business").
+    """
+    if not AIRPORTS_CSV.exists():
+        raise FileNotFoundError(
+            f"Missing airport reference file: {AIRPORTS_CSV}. "
+            "Expected columns: Airport, IATA, Latitude, Longitude, "
+            "Passenger importance, Freight importance."
+        )
+
+    raw = pd.read_csv(AIRPORTS_CSV)
+    raw.columns = raw.columns.str.strip()
+
+    airports = []
+    for _, row in raw.iterrows():
+        airports.append({
+            "code": str(row["IATA"]).strip(),
+            "name": str(row["Airport"]).strip(),
+            "lat": float(row["Latitude"]),
+            "lon": float(row["Longitude"]),
+            "passenger_importance": str(row["Passenger importance"]).strip(),
+            "freight_importance": str(row["Freight importance"]).strip(),
+        })
+
+    return airports
+
+
+def circle_area(radius):
+    """Area of a circle of the given radius, in that radius's squared unit."""
+    return float(np.pi * radius ** 2)
+
+
+def local_population_window(lats, lons, populations, query_idx, window_radius_km):
+    """
+    Approximate, for each of the given query points, the total population within
+    an axis-aligned square window (side ~2 * window_radius_km) centred on that
+    point, using a fixed spatial grid + 2D prefix sum (integral image).
+
+    This is an O(N + grid cells) approximation to an exact circular radius
+    query. An exact per-point BallTree radius search is O(N * neighbours),
+    which is unbounded in dense urban centres -- a 5-mile petal-run circle in
+    central London can contain hundreds of thousands of postcodes, so summing
+    that for every eligible postcode can exhaust tens of GB of RAM. The grid
+    here is sized off the window radius, not the number of points, so memory
+    stays flat regardless of local postcode density.
+    """
+    n = len(lats)
+    if n == 0 or len(query_idx) == 0:
+        return np.zeros(len(query_idx), dtype=np.float64)
+
+    lat0 = float(np.mean(lats))
+    lon0 = float(np.mean(lons))
+    x_km = (lons - lon0) * 111.320 * np.cos(np.radians(lat0))
+    y_km = (lats - lat0) * 110.574
+
+    # Grid resolution: fine enough that the square window is a reasonable
+    # stand-in for the circle, but independent of how many points fall in it.
+    cell_km = max(window_radius_km / 8.0, 0.05)
+
+    min_x, min_y = x_km.min(), y_km.min()
+    col_idx = np.floor((x_km - min_x) / cell_km).astype(np.int64)
+    row_idx = np.floor((y_km - min_y) / cell_km).astype(np.int64)
+
+    n_cols = int(col_idx.max()) + 1
+    n_rows = int(row_idx.max()) + 1
+
+    flat_idx = row_idx * n_cols + col_idx
+    grid_pop = np.bincount(
+        flat_idx, weights=populations.astype(np.float64), minlength=n_rows * n_cols
+    ).reshape(n_rows, n_cols)
+
+    # Prefix sum padded with a leading zero row/col for O(1) rectangle sums.
+    prefix = np.zeros((n_rows + 1, n_cols + 1), dtype=np.float64)
+    prefix[1:, 1:] = np.cumsum(np.cumsum(grid_pop, axis=0), axis=1)
+
+    half_cells = int(np.ceil(window_radius_km / cell_km))
+
+    q_row = row_idx[query_idx]
+    q_col = col_idx[query_idx]
+
+    r0 = np.clip(q_row - half_cells, 0, n_rows)
+    r1 = np.clip(q_row + half_cells + 1, 0, n_rows)
+    c0 = np.clip(q_col - half_cells, 0, n_cols)
+    c1 = np.clip(q_col + half_cells + 1, 0, n_cols)
+
+    return (
+        prefix[r1, c1] - prefix[r0, c1] - prefix[r1, c0] + prefix[r0, c0]
+    )
+
+
+def _empty_cross_border_result(airport):
+    return {
+        "airport_code": airport["code"],
+        "airport_name": airport["name"],
+        "lat": float(airport["lat"]),
+        "lon": float(airport["lon"]),
+        "eligible_postcodes": 0,
+        "eligible_population": 0.0,
+        "postcodes": 0,
+        "population": 0.0,
+        "potential_postcodes": 0,
+        "potential_population": 0.0,
+        "overlap_population": 0.0,
+        "excluded_by_min_population": 0,
+        "excluded_by_max_density": 0,
+    }
+
+
+def evaluate_cross_border_airports(
+    df,
+    airports,
+    outer_radius_km,
+    circle_radius_km,
+    circle_radius_display,
+    density_threshold,
+    radius_unit="miles",
+    min_population_per_postcode=None,
+    max_density_per_postcode=None,
+):
+    """
+    For each airport, find postcodes within `outer_radius_km` of it whose local
+    population density -- population within `circle_radius_km` of the postcode
+    itself, divided by the circle's area -- meets `density_threshold`. A
+    postcode's own neighbourhood can extend up to `circle_radius_km` beyond the
+    outer radius, so the true search reach is outer + circle.
+
+    Density (and the optional per-postcode population/density caps) is
+    expressed per unit of `circle_radius_display`'s squared unit, e.g. people
+    per square mile when the UI is set to miles.
+
+    Postcodes are attributed to the first airport (in `airports` order) that
+    covers them, mirroring the net-new/overlap accounting used for hubs.
+
+    Returns (airport_results, covered_postcodes, multi_df, single_df, total_eligible_population).
+    """
+    area = circle_area(circle_radius_display)
+    if area <= 0:
+        raise ValueError("Circle radius must be greater than zero.")
+
+    use_miles = radius_unit.lower() in ("mile", "miles", "mi")
+    dist_col = f"Distance to Airport ({radius_unit})"
+    density_col = f"Local Density (per sq {'mi' if use_miles else 'km'})"
+    map_cols = ["Postcode", "Lat", "Lon", "Population", density_col, "Airport", "Airport Code", dist_col]
+
+    search_radius_km = outer_radius_km + circle_radius_km
+
+    airport_results = []
+    covered_postcodes = set()
+    eligible_population_by_postcode = {}
+    multi_dfs = []
+    # postcode -> (dist_km, airport_code, airport_name, population, density, dist_display)
+    best = {}
+
+    for airport in airports:
+        lat, lon = airport["lat"], airport["lon"]
+
+        nearby_df = filter_city(df, lat, lon, search_radius_km).reset_index(drop=True)
+
+        if nearby_df.empty:
+            airport_results.append(_empty_cross_border_result(airport))
+            continue
+
+        dist_to_airport_km = haversine_array(
+            lat, lon, nearby_df["lat"].to_numpy(), nearby_df["lon"].to_numpy()
+        )
+        eligible_idx = np.where(dist_to_airport_km <= outer_radius_km)[0]
+
+        if len(eligible_idx) == 0:
+            airport_results.append(_empty_cross_border_result(airport))
+            continue
+
+        populations = nearby_df["population"].to_numpy(dtype=np.float32)
+
+        for pc, pop in zip(
+            nearby_df.iloc[eligible_idx]["postcode"], populations[eligible_idx]
+        ):
+            eligible_population_by_postcode[pc] = float(pop)
+
+        local_population = local_population_window(
+            nearby_df["lat"].to_numpy(dtype=np.float64),
+            nearby_df["lon"].to_numpy(dtype=np.float64),
+            populations,
+            eligible_idx,
+            circle_radius_km,
+        )
+        local_density = local_population / area
+
+        qualifies = local_density >= density_threshold
+        eligible_own_population = populations[eligible_idx]
+
+        excluded_min_pop = 0
+        if min_population_per_postcode is not None:
+            fails = qualifies & (eligible_own_population < min_population_per_postcode)
+            excluded_min_pop = int(fails.sum())
+            qualifies &= ~fails
+
+        excluded_max_density = 0
+        if max_density_per_postcode is not None:
+            fails = qualifies & (local_density > max_density_per_postcode)
+            excluded_max_density = int(fails.sum())
+            qualifies &= ~fails
+
+        qualifying_idx = eligible_idx[qualifies]
+        potential_population = float(populations[qualifying_idx].sum())
+        potential_postcodes = int(len(qualifying_idx))
+
+        if potential_postcodes > 0:
+            batch = nearby_df.iloc[qualifying_idx][["postcode", "lat", "lon", "population"]].copy()
+            batch.columns = ["Postcode", "Lat", "Lon", "Population"]
+            batch["Lat"] = batch["Lat"].round(5)
+            batch["Lon"] = batch["Lon"].round(5)
+
+            qualifying_density = local_density[qualifies]
+            dists_km = dist_to_airport_km[qualifying_idx]
+            dists_display = dists_km / KM_PER_MILE if use_miles else dists_km
+
+            batch[density_col] = np.round(qualifying_density, 2)
+            batch["Airport"] = airport["name"]
+            batch["Airport Code"] = airport["code"]
+            batch[dist_col] = np.round(dists_display, 4)
+            multi_dfs.append(batch[map_cols])
+
+            is_new = ~batch["Postcode"].isin(covered_postcodes)
+            new_postcode_count = int(is_new.sum())
+            new_population = float(batch.loc[is_new, "Population"].sum())
+            covered_postcodes.update(batch["Postcode"])
+
+            for pc, d_km, d_dis, pop, dens in zip(
+                batch["Postcode"], dists_km, dists_display, batch["Population"], qualifying_density
+            ):
+                prev = best.get(pc)
+                if prev is None or d_km < prev[0]:
+                    best[pc] = (float(d_km), airport["code"], airport["name"], float(pop), float(dens), float(d_dis))
+        else:
+            new_postcode_count = 0
+            new_population = 0.0
+
+        airport_results.append({
+            "airport_code": airport["code"],
+            "airport_name": airport["name"],
+            "lat": float(lat),
+            "lon": float(lon),
+            "eligible_postcodes": int(len(eligible_idx)),
+            "eligible_population": float(eligible_own_population.sum()),
+            "postcodes": new_postcode_count,
+            "population": new_population,
+            "potential_postcodes": potential_postcodes,
+            "potential_population": potential_population,
+            "overlap_population": potential_population - new_population,
+            "excluded_by_min_population": excluded_min_pop,
+            "excluded_by_max_density": excluded_max_density,
+        })
+
+    multi_df = (
+        pd.concat(multi_dfs, ignore_index=True)
+        .sort_values(["Airport Code", "Postcode"])
+        .reset_index(drop=True)
+        if multi_dfs else pd.DataFrame(columns=map_cols)
+    )
+
+    if best:
+        rows = []
+        for pc, (d_km, code, name, pop, dens, d_dis) in best.items():
+            rows.append((pc, code, name, pop, dens, d_dis))
+        single_df = pd.DataFrame(
+            rows, columns=["Postcode", "Airport Code", "Airport", "Population", density_col, dist_col]
+        )
+        latlon_lookup = multi_df.drop_duplicates("Postcode").set_index("Postcode")[["Lat", "Lon"]]
+        single_df = single_df.join(latlon_lookup, on="Postcode")
+        single_df = single_df[map_cols].sort_values(["Airport Code", "Postcode"]).reset_index(drop=True)
+    else:
+        single_df = pd.DataFrame(columns=map_cols)
+
+    total_eligible_population = float(sum(eligible_population_by_postcode.values()))
+
+    return airport_results, covered_postcodes, multi_df, single_df, total_eligible_population
+
+
+def create_cross_border_map(
+    airports,
+    outer_radius_km,
+    unit,
+    covered_df,
+    output_file="Cross_Border_Map.html",
+):
+    if not airports:
+        raise ValueError("At least one airport must be selected.")
+
+    centre_lat = float(np.mean([a["lat"] for a in airports]))
+    centre_lon = float(np.mean([a["lon"] for a in airports]))
+
+    m = folium.Map(location=[centre_lat, centre_lon], zoom_start=7, control_scale=True)
+
+    use_miles = unit.lower() in ("mile", "miles", "mi")
+    outer_radius_display = outer_radius_km / KM_PER_MILE if use_miles else outer_radius_km
+
+    for i, airport in enumerate(airports):
+        color = HUB_COLORS[i % len(HUB_COLORS)]
+
+        folium.Marker(
+            [airport["lat"], airport["lon"]],
+            popup=f"<b>{airport['name']} ({airport['code']})</b>",
+            tooltip=f"{airport['name']} ({airport['code']})",
+            icon=folium.Icon(color=color, icon="plane", prefix="fa"),
+        ).add_to(m)
+
+        folium.Circle(
+            [airport["lat"], airport["lon"]],
+            radius=outer_radius_km * 1000,
+            color=color,
+            fill=False,
+            weight=2,
+            popup=f"{airport['name']} catchment radius: {outer_radius_display:.1f} {unit}",
+        ).add_to(m)
+
+    if covered_df is not None and not covered_df.empty:
+        heat_data = covered_df[["lat", "lon", "population"]].values.tolist()
+        HeatMap(
+            heat_data, radius=8, blur=6, max_zoom=11, name="Covered postcodes (by population)"
+        ).add_to(m)
+        folium.LayerControl().add_to(m)
+
+    m.save(output_file)
+    print(f"\nCross-border map saved to {output_file}")
+
+
+def run_cross_border_optimisation(
+    airport_codes,
+    outer_radius,
+    circle_radius,
+    density_threshold,
+    radius_unit="miles",
+    min_population_per_postcode=None,
+    max_density_per_postcode=None,
+    create_map_output=True,
+    map_filename="Cross_Border_Map.html",
+):
+    all_airports = load_uk_airports()
+    airports = [a for a in all_airports if a["code"] in airport_codes]
+    if not airports:
+        raise ValueError("At least one airport must be selected.")
+
+    outer_radius_km = convert_to_km(outer_radius, radius_unit)
+    circle_radius_km = convert_to_km(circle_radius, radius_unit)
+
+    df = load_postcode_data()
+
+    airport_results, covered_postcodes, multi_df, single_df, total_eligible_population = (
+        evaluate_cross_border_airports(
+            df,
+            airports,
+            outer_radius_km=outer_radius_km,
+            circle_radius_km=circle_radius_km,
+            circle_radius_display=circle_radius,
+            density_threshold=density_threshold,
+            radius_unit=radius_unit,
+            min_population_per_postcode=min_population_per_postcode,
+            max_density_per_postcode=max_density_per_postcode,
+        )
+    )
+
+    covered_population = float(single_df["Population"].sum()) if not single_df.empty else 0.0
+    coverage_pct = (
+        0.0 if total_eligible_population == 0
+        else 100.0 * covered_population / total_eligible_population
+    )
+
+    if create_map_output:
+        if not single_df.empty:
+            covered_map_df = single_df.rename(
+                columns={"Lat": "lat", "Lon": "lon", "Population": "population"}
+            )
+        else:
+            covered_map_df = pd.DataFrame(columns=["lat", "lon", "population"])
+
+        create_cross_border_map(
+            airports,
+            outer_radius_km=outer_radius_km,
+            unit=radius_unit,
+            covered_df=covered_map_df,
+            output_file=map_filename,
+        )
+
+    return {
+        "mode": "cross_border",
+        "airports": airport_results,
+        "outer_radius": outer_radius,
+        "circle_radius": circle_radius,
+        "radius_unit": radius_unit,
+        "density_threshold": density_threshold,
+        "min_population_per_postcode": min_population_per_postcode,
+        "max_density_per_postcode": max_density_per_postcode,
+        "total_population": total_eligible_population,
+        "covered_population": covered_population,
+        "coverage_pct": coverage_pct,
+        "covered_postcodes": covered_postcodes,
+        "multi_hub_df": multi_df,
+        "single_hub_df": single_df,
+    }
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ from main import (
     run_fixed_hub_coverage_polygon,
     run_hybrid_optimisation_polygon,
     run_hub_optimisation_polygon_by_coverage,
+    run_cross_border_optimisation,
+    load_uk_airports,
 )
 
 
@@ -200,6 +202,57 @@ def render_results(result, map_filename="user_polygon_result.html"):
         st.warning("Map file not found — it may not have been generated.")
 
 
+def build_cross_border_results_df(airport_results):
+    rows = []
+    for a in airport_results:
+        pot_pop = a["potential_population"] or a["population"]
+        overlap_pct = (100.0 * a["overlap_population"] / pot_pop) if pot_pop > 0 else 0.0
+        rows.append({
+            "Airport":                a["airport_name"],
+            "Code":                   a["airport_code"],
+            "New Postcodes":          int(a["postcodes"]),
+            "New Population":         int(a["population"]),
+            "Eligible Postcodes":     int(a["eligible_postcodes"]),
+            "Eligible Population":    int(a["eligible_population"]),
+            "Qualifying Postcodes":   int(a["potential_postcodes"]),
+            "Overlap Pop.":           int(a["overlap_population"]),
+            "Overlap %":              f"{overlap_pct:.1f}%",
+            "Excluded (min pop)":     int(a["excluded_by_min_population"]),
+            "Excluded (max density)": int(a["excluded_by_max_density"]),
+        })
+    return pd.DataFrame(rows)
+
+
+def render_cross_border_results(result, map_filename="Cross_Border_Map.html"):
+    st.markdown("---")
+    st.subheader("Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Eligible Population (in radius)", f"{result['total_population']:,.0f}")
+    c2.metric("Qualifying Population",            f"{result['covered_population']:,.0f}")
+    c3.metric("Qualifying %",                     f"{result['coverage_pct']:.1f}%")
+    c4.metric("Airports Used",                    str(len(result["airports"])))
+
+    multi_df = result.get("multi_hub_df", pd.DataFrame())
+    single_df = result.get("single_hub_df", pd.DataFrame())
+    if not multi_df.empty:
+        st.markdown("#### Download Covered Postcodes")
+        download_buttons(multi_df, single_df, key_prefix="cb_top")
+
+    st.markdown("#### Airport Summary")
+    st.dataframe(build_cross_border_results_df(result["airports"]), width='stretch', hide_index=True)
+
+    st.caption(f"Map output saved to `{map_filename}`.")
+    st.markdown("#### Coverage Map")
+    try:
+        with open(map_filename, "r", encoding="utf-8") as f:
+            map_html = f.read()
+        encoded = base64.b64encode(map_html.encode()).decode()
+        st.iframe(f"data:text/html;base64,{encoded}", height=550)
+    except FileNotFoundError:
+        st.warning("Map file not found — it may not have been generated.")
+
+
 # --------------------------------------------------
 # Page config
 # --------------------------------------------------
@@ -207,214 +260,360 @@ def render_results(result, map_filename="user_polygon_result.html"):
 st.set_page_config(page_title="Hub Optimizer", layout="wide")
 st.title("Hub Optimizer")
 
-# --------------------------------------------------
-# Sidebar — optimization settings
-# --------------------------------------------------
+tab_hub, tab_cross = st.tabs(["Hub Optimizer", "Cross Border"])
 
-st.sidebar.header("Optimization Settings")
+with tab_hub:
 
-opt_mode = st.sidebar.radio(
-    "Optimization mode",
-    ["Number of hubs", "Target coverage %"],
-    index=0,
-    help="Specify the number of hubs directly, or let the optimizer find how many are needed to hit a coverage target.",
-)
+    # --------------------------------------------------
+    # Sidebar — optimization settings
+    # --------------------------------------------------
 
-if opt_mode == "Number of hubs":
-    num_hubs = st.sidebar.number_input("Total number of hubs", min_value=1, max_value=50, value=4)
-else:
-    target_coverage = st.sidebar.slider(
-        "Target coverage (%)",
-        min_value=10,
-        max_value=99,
-        value=80,
-        step=1,
-        help="The optimizer will keep adding hubs until this population coverage percentage is reached.",
-    )
-    max_hubs = st.sidebar.number_input(
-        "Max hubs cap",
-        min_value=1,
-        max_value=100,
-        value=20,
-        help="Safety limit — optimization stops here even if the target coverage has not been reached.",
+    st.sidebar.header("Optimization Settings")
+
+    opt_mode = st.sidebar.radio(
+        "Optimization mode",
+        ["Number of hubs", "Target coverage %"],
+        index=0,
+        help="Specify the number of hubs directly, or let the optimizer find how many are needed to hit a coverage target.",
     )
 
-hub_radius = st.sidebar.number_input("Hub radius", min_value=0.1, value=5.0)
-radius_unit = st.sidebar.selectbox("Radius unit", ["miles", "km"], index=0)
-grid_spacing_km = st.sidebar.number_input(
-    "Grid spacing (km)",
-    min_value=0.25,
-    max_value=5.0,
-    value=1.0,
-    step=0.25,
-    help="Distance between candidate hub locations. Larger = faster and less memory. 1 km is a good default.",
-)
+    if opt_mode == "Number of hubs":
+        num_hubs = st.sidebar.number_input("Total number of hubs", min_value=1, max_value=50, value=4)
+    else:
+        target_coverage = st.sidebar.slider(
+            "Target coverage (%)",
+            min_value=10,
+            max_value=99,
+            value=80,
+            step=1,
+            help="The optimizer will keep adding hubs until this population coverage percentage is reached.",
+        )
+        max_hubs = st.sidebar.number_input(
+            "Max hubs cap",
+            min_value=1,
+            max_value=100,
+            value=20,
+            help="Safety limit — optimization stops here even if the target coverage has not been reached.",
+        )
 
-# --------------------------------------------------
-# Sidebar — fixed hubs (number of hubs mode only)
-# --------------------------------------------------
+    hub_radius = st.sidebar.number_input("Hub radius", min_value=0.1, value=5.0)
+    radius_unit = st.sidebar.selectbox("Radius unit", ["miles", "km"], index=0)
+    grid_spacing_km = st.sidebar.number_input(
+        "Grid spacing (km)",
+        min_value=0.25,
+        max_value=5.0,
+        value=1.0,
+        step=0.25,
+        help="Distance between candidate hub locations. Larger = faster and less memory. 1 km is a good default.",
+    )
 
-fixed_hubs_input = []
+    # --------------------------------------------------
+    # Sidebar — fixed hubs (number of hubs mode only)
+    # --------------------------------------------------
 
-if opt_mode == "Number of hubs":
-    st.sidebar.markdown("---")
-    st.sidebar.header("Fixed Hubs (optional)")
+    fixed_hubs_input = []
 
-    max_fixed = int(num_hubs)
-    num_fixed = int(st.sidebar.number_input(
-        "Number of fixed hubs",
-        min_value=0,
-        max_value=max_fixed,
-        value=0,
-        help=f"Pin up to {max_fixed} location(s). Remaining hubs will be optimized automatically.",
-    ))
+    if opt_mode == "Number of hubs":
+        st.sidebar.markdown("---")
+        st.sidebar.header("Fixed Hubs (optional)")
 
-    for i in range(num_fixed):
-        st.sidebar.markdown(f"**Fixed Hub {i + 1}**")
-        name = st.sidebar.text_input("Name", key=f"fh_name_{i}", value=f"Fixed Hub {i + 1}")
-        col_a, col_b = st.sidebar.columns(2)
-        lat = col_a.number_input("Lat", key=f"fh_lat_{i}", value=52.4800, format="%.5f", step=0.001)
-        lon = col_b.number_input("Lon", key=f"fh_lon_{i}", value=-1.8900, format="%.5f", step=0.001)
-        fixed_hubs_input.append((name.strip(), float(lat), float(lon)))
+        max_fixed = int(num_hubs)
+        num_fixed = int(st.sidebar.number_input(
+            "Number of fixed hubs",
+            min_value=0,
+            max_value=max_fixed,
+            value=0,
+            help=f"Pin up to {max_fixed} location(s). Remaining hubs will be optimized automatically.",
+        ))
 
-    if num_fixed > 0:
-        num_free = int(num_hubs) - num_fixed
-        if num_free > 0:
-            st.sidebar.caption(f"↳ {num_free} hub(s) will be optimized automatically.")
-        else:
-            st.sidebar.caption("↳ All hubs are fixed — no optimization will run.")
+        for i in range(num_fixed):
+            st.sidebar.markdown(f"**Fixed Hub {i + 1}**")
+            name = st.sidebar.text_input("Name", key=f"fh_name_{i}", value=f"Fixed Hub {i + 1}")
+            col_a, col_b = st.sidebar.columns(2)
+            lat = col_a.number_input("Lat", key=f"fh_lat_{i}", value=52.4800, format="%.5f", step=0.001)
+            lon = col_b.number_input("Lon", key=f"fh_lon_{i}", value=-1.8900, format="%.5f", step=0.001)
+            fixed_hubs_input.append((name.strip(), float(lat), float(lon)))
 
-# --------------------------------------------------
-# Map
-# --------------------------------------------------
-
-base_map = folium.Map(location=[52.48, -1.89], zoom_start=10, control_scale=True)
-Draw(
-    draw_options={
-        "polyline": False,
-        "rectangle": True,
-        "circle": False,
-        "circlemarker": False,
-        "marker": False,
-        "polygon": True,
-    },
-    edit_options={"edit": True, "remove": True},
-).add_to(base_map)
-
-st.write("Draw a polygon or rectangle on the map to define your search area.")
-map_data = st_folium(base_map, width=1000, height=600, key=f"map_{st.session_state.get('map_key', 0)}")
-
-# --------------------------------------------------
-# Extract geometry — no st.stop() used here
-# --------------------------------------------------
-
-raw_drawings = map_data.get("all_drawings") or []
-drawn_features = [f for f in raw_drawings if f is not None]
-geometry = drawn_features[-1].get("geometry") if drawn_features else None
-
-if not geometry:
-    st.info("No polygon drawn yet. Use the drawing tools on the left side of the map.")
-
-else:
-    try:
-        boundary_points = geojson_polygon_to_latlon_list(geometry)
-    except Exception as e:
-        st.error(str(e))
-        boundary_points = None
-
-    if boundary_points is not None:
-        n_pts = len(boundary_points)
-        st.success(f"✅ Area defined — {n_pts} boundary point{'s' if n_pts != 1 else ''}.")
-
-        with st.expander("View boundary points"):
-            preview = (
-                boundary_points[:4] + [["...", "..."]] + boundary_points[-4:]
-                if n_pts > 8 else boundary_points
-            )
-            st.code(json.dumps(preview, indent=2), language="json")
-
-        if opt_mode == "Number of hubs":
-            num_free = int(num_hubs) - len(fixed_hubs_input)
-            if not fixed_hubs_input:
-                run_label = "🚀 Run Optimization"
-            elif num_free == 0:
-                run_label = f"🗺️ Compute Coverage  ({len(fixed_hubs_input)} fixed hub{'s' if len(fixed_hubs_input) != 1 else ''})"
+        if num_fixed > 0:
+            num_free = int(num_hubs) - num_fixed
+            if num_free > 0:
+                st.sidebar.caption(f"↳ {num_free} hub(s) will be optimized automatically.")
             else:
-                run_label = f"🚀 Run Optimization  ({len(fixed_hubs_input)} fixed · {num_free} optimized)"
-        else:
-            run_label = f"🚀 Find Hubs for {target_coverage}% Coverage"
+                st.sidebar.caption("↳ All hubs are fixed — no optimization will run.")
 
-        if st.button(run_label, type="primary"):
-            overlay = st.empty()
+    # --------------------------------------------------
+    # Map
+    # --------------------------------------------------
 
-            if opt_mode == "Target coverage %":
-                show_overlay(
-                    overlay,
-                    message=f"Finding hubs for {target_coverage}% coverage…",
-                    subtext=f"Adding hubs until {target_coverage}% of the population is covered (max {int(max_hubs)}).",
+    base_map = folium.Map(location=[52.48, -1.89], zoom_start=10, control_scale=True)
+    Draw(
+        draw_options={
+            "polyline": False,
+            "rectangle": True,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": True,
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(base_map)
+
+    st.write("Draw a polygon or rectangle on the map to define your search area.")
+    map_data = st_folium(base_map, width=1000, height=600, key=f"map_{st.session_state.get('map_key', 0)}")
+
+    # --------------------------------------------------
+    # Extract geometry — no st.stop() used here
+    # --------------------------------------------------
+
+    raw_drawings = map_data.get("all_drawings") or []
+    drawn_features = [f for f in raw_drawings if f is not None]
+    geometry = drawn_features[-1].get("geometry") if drawn_features else None
+
+    if not geometry:
+        st.info("No polygon drawn yet. Use the drawing tools on the left side of the map.")
+
+    else:
+        try:
+            boundary_points = geojson_polygon_to_latlon_list(geometry)
+        except Exception as e:
+            st.error(str(e))
+            boundary_points = None
+
+        if boundary_points is not None:
+            n_pts = len(boundary_points)
+            st.success(f"✅ Area defined — {n_pts} boundary point{'s' if n_pts != 1 else ''}.")
+
+            with st.expander("View boundary points"):
+                preview = (
+                    boundary_points[:4] + [["...", "..."]] + boundary_points[-4:]
+                    if n_pts > 8 else boundary_points
                 )
-            elif fixed_hubs_input and num_free == 0:
-                show_overlay(
-                    overlay,
-                    message="Computing coverage…",
-                    subtext=f"Evaluating {len(fixed_hubs_input)} fixed hub(s) across {n_pts} boundary points.",
-                )
+                st.code(json.dumps(preview, indent=2), language="json")
+
+            if opt_mode == "Number of hubs":
+                num_free = int(num_hubs) - len(fixed_hubs_input)
+                if not fixed_hubs_input:
+                    run_label = "🚀 Run Optimization"
+                elif num_free == 0:
+                    run_label = f"🗺️ Compute Coverage  ({len(fixed_hubs_input)} fixed hub{'s' if len(fixed_hubs_input) != 1 else ''})"
+                else:
+                    run_label = f"🚀 Run Optimization  ({len(fixed_hubs_input)} fixed · {num_free} optimized)"
             else:
-                show_overlay(
-                    overlay,
-                    message="Optimizing…",
-                    subtext=f"Placing {int(num_hubs)} hub(s) across {n_pts} boundary points.",
-                )
+                run_label = f"🚀 Find Hubs for {target_coverage}% Coverage"
 
-            try:
+            if st.button(run_label, type="primary"):
+                overlay = st.empty()
+
                 if opt_mode == "Target coverage %":
-                    result = run_hub_optimisation_polygon_by_coverage(
-                        boundary_points=boundary_points,
-                        target_coverage_pct=float(target_coverage),
-                        hub_radius=hub_radius,
-                        radius_unit=radius_unit,
-                        max_hubs=int(max_hubs),
-                        grid_spacing_km=float(grid_spacing_km),
-                        create_map_output=True,
-                        map_filename="user_polygon_result.html",
-                    )
-                elif fixed_hubs_input and num_free > 0:
-                    result = run_hybrid_optimisation_polygon(
-                        boundary_points=boundary_points,
-                        fixed_hubs=fixed_hubs_input,
-                        num_free_hubs=num_free,
-                        hub_radius=hub_radius,
-                        radius_unit=radius_unit,
-                        grid_spacing_km=float(grid_spacing_km),
-                        map_filename="user_polygon_result.html",
+                    show_overlay(
+                        overlay,
+                        message=f"Finding hubs for {target_coverage}% coverage…",
+                        subtext=f"Adding hubs until {target_coverage}% of the population is covered (max {int(max_hubs)}).",
                     )
                 elif fixed_hubs_input and num_free == 0:
-                    result = run_fixed_hub_coverage_polygon(
-                        boundary_points=boundary_points,
-                        hubs=fixed_hubs_input,
-                        hub_radius=hub_radius,
-                        radius_unit=radius_unit,
-                        create_map_output=True,
-                        map_filename="user_polygon_result.html",
+                    show_overlay(
+                        overlay,
+                        message="Computing coverage…",
+                        subtext=f"Evaluating {len(fixed_hubs_input)} fixed hub(s) across {n_pts} boundary points.",
                     )
                 else:
-                    result = run_hub_optimisation_polygon(
-                        boundary_points=boundary_points,
-                        num_hubs=int(num_hubs),
-                        hub_radius=hub_radius,
-                        radius_unit=radius_unit,
-                        use_optimized=True,
-                        grid_spacing_km=float(grid_spacing_km),
-                        create_map_output=True,
-                        map_filename="user_polygon_result.html",
+                    show_overlay(
+                        overlay,
+                        message="Optimizing…",
+                        subtext=f"Placing {int(num_hubs)} hub(s) across {n_pts} boundary points.",
                     )
-                overlay.empty()
-                st.session_state["result"] = result
-                st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
-                st.rerun()
-            except Exception as e:
-                overlay.empty()
-                st.error(str(e))
 
-if "result" in st.session_state:
-    render_results(st.session_state["result"])
+                try:
+                    if opt_mode == "Target coverage %":
+                        result = run_hub_optimisation_polygon_by_coverage(
+                            boundary_points=boundary_points,
+                            target_coverage_pct=float(target_coverage),
+                            hub_radius=hub_radius,
+                            radius_unit=radius_unit,
+                            max_hubs=int(max_hubs),
+                            grid_spacing_km=float(grid_spacing_km),
+                            create_map_output=True,
+                            map_filename="user_polygon_result.html",
+                        )
+                    elif fixed_hubs_input and num_free > 0:
+                        result = run_hybrid_optimisation_polygon(
+                            boundary_points=boundary_points,
+                            fixed_hubs=fixed_hubs_input,
+                            num_free_hubs=num_free,
+                            hub_radius=hub_radius,
+                            radius_unit=radius_unit,
+                            grid_spacing_km=float(grid_spacing_km),
+                            map_filename="user_polygon_result.html",
+                        )
+                    elif fixed_hubs_input and num_free == 0:
+                        result = run_fixed_hub_coverage_polygon(
+                            boundary_points=boundary_points,
+                            hubs=fixed_hubs_input,
+                            hub_radius=hub_radius,
+                            radius_unit=radius_unit,
+                            create_map_output=True,
+                            map_filename="user_polygon_result.html",
+                        )
+                    else:
+                        result = run_hub_optimisation_polygon(
+                            boundary_points=boundary_points,
+                            num_hubs=int(num_hubs),
+                            hub_radius=hub_radius,
+                            radius_unit=radius_unit,
+                            use_optimized=True,
+                            grid_spacing_km=float(grid_spacing_km),
+                            create_map_output=True,
+                            map_filename="user_polygon_result.html",
+                        )
+                    overlay.empty()
+                    st.session_state["result"] = result
+                    st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
+                    st.rerun()
+                except Exception as e:
+                    overlay.empty()
+                    st.error(str(e))
+
+    if "result" in st.session_state:
+        render_results(st.session_state["result"])
+
+
+with tab_cross:
+
+    st.write(
+        "Find postcodes within reach of UK air/sea points of entry, for fulfilment "
+        "into dense postcodes. Set a catchment radius around each entry point, plus "
+        "a local delivery ('petal run') radius used to judge postcode density."
+    )
+
+    airports = load_uk_airports()
+    freight_levels = ["Major", "Regional", "Limited", "Specialist/business"]
+    present_levels = [lvl for lvl in freight_levels if any(a["freight_importance"] == lvl for a in airports)]
+
+    st.markdown("#### Entry Points")
+
+    quick_filter = st.multiselect(
+        "Quick-select by freight importance",
+        options=present_levels,
+        default=["Major"] if "Major" in present_levels else present_levels[:1],
+        help="Airports/ports used for freight import. Click 'Apply' to load these into the selection below — "
+             "you can still add or remove individual airports afterwards.",
+        key="cb_freight_filter",
+    )
+
+    if "cb_airport_names" not in st.session_state:
+        st.session_state["cb_airport_names"] = [
+            a["name"] for a in airports if a["freight_importance"] in quick_filter
+        ]
+
+    if st.button("Apply freight filter to selection"):
+        st.session_state["cb_airport_names"] = [
+            a["name"] for a in airports if a["freight_importance"] in quick_filter
+        ]
+
+    airport_options = [
+        f'{a["name"]} ({a["code"]}) — Freight: {a["freight_importance"]}, Passenger: {a["passenger_importance"]}'
+        for a in airports
+    ]
+    name_by_option = {opt: a["name"] for opt, a in zip(airport_options, airports)}
+    option_by_name = {a["name"]: opt for opt, a in zip(airport_options, airports)}
+
+    selected_options = st.multiselect(
+        "Selected entry points",
+        options=airport_options,
+        default=[option_by_name[n] for n in st.session_state["cb_airport_names"] if n in option_by_name],
+        help="Currently UK airports only — ports will be added in future.",
+    )
+    selected_names = [name_by_option[o] for o in selected_options]
+    st.session_state["cb_airport_names"] = selected_names
+
+    st.markdown("#### Catchment Settings")
+
+    cb_c1, cb_c2, cb_c3 = st.columns(3)
+    with cb_c1:
+        cb_radius_unit = st.selectbox("Radius unit", ["miles", "km"], index=0, key="cb_radius_unit")
+    with cb_c2:
+        outer_radius = st.number_input(
+            "Radius around entry point",
+            min_value=0.1,
+            value=30.0,
+            step=1.0,
+            help="How far from the airport a postcode can be to be considered at all.",
+            key="cb_outer_radius",
+        )
+    with cb_c3:
+        petal_radius = st.number_input(
+            "Petal run radius",
+            min_value=0.1,
+            value=5.0,
+            step=0.5,
+            help="Local last-mile delivery radius used to judge each postcode's surrounding density.",
+            key="cb_petal_radius",
+        )
+
+    total_radius = outer_radius + petal_radius
+    st.caption(
+        f"Total search reach from each entry point: **{total_radius:.1f} {cb_radius_unit}** "
+        f"({outer_radius:.1f} catchment + {petal_radius:.1f} petal run)."
+    )
+
+    st.markdown("#### Density / Volume Filters")
+
+    cb_d1, cb_d2 = st.columns(2)
+    with cb_d1:
+        min_population_per_postcode = st.number_input(
+            "Minimum population per postcode",
+            min_value=0.0,
+            value=0.0,
+            step=10.0,
+            help="Postcodes with fewer people than this are excluded. 0 = no filter.",
+            key="cb_min_population",
+        )
+    with cb_d2:
+        density_threshold = st.number_input(
+            f"Minimum local density (people per sq {cb_radius_unit})",
+            min_value=0.0,
+            value=0.0,
+            step=50.0,
+            help=(
+                f"A postcode's local density is the population within the petal run radius of it, "
+                f"divided by the petal run circle's area. Postcodes below this density are excluded. 0 = no filter."
+            ),
+            key="cb_density_threshold",
+        )
+
+    run_disabled = len(selected_names) == 0
+    if run_disabled:
+        st.info("Select at least one entry point to run.")
+
+    if st.button("🚀 Compute Cross-Border Coverage", type="primary", disabled=run_disabled):
+        overlay = st.empty()
+        show_overlay(
+            overlay,
+            message="Computing cross-border coverage…",
+            subtext=f"Evaluating {len(selected_names)} entry point(s) with a "
+                    f"{total_radius:.1f} {cb_radius_unit} total reach.",
+        )
+
+        try:
+            airport_codes = [
+                a["code"] for a in airports if a["name"] in selected_names
+            ]
+            cb_result = run_cross_border_optimisation(
+                airport_codes=airport_codes,
+                outer_radius=float(outer_radius),
+                circle_radius=float(petal_radius),
+                density_threshold=float(density_threshold),
+                radius_unit=cb_radius_unit,
+                min_population_per_postcode=float(min_population_per_postcode),
+                create_map_output=True,
+                map_filename="Cross_Border_Map.html",
+            )
+            overlay.empty()
+            st.session_state["cb_result"] = cb_result
+            st.rerun()
+        except Exception as e:
+            overlay.empty()
+            st.error(str(e))
+
+    if "cb_result" in st.session_state:
+        render_cross_border_results(st.session_state["cb_result"])
