@@ -217,6 +217,8 @@ def build_cross_border_results_df(airport_results):
             "Excluded (min pop)":     int(a["excluded_by_min_population"]),
             "Excluded (max density)": int(a["excluded_by_max_density"]),
             "Excluded (island)":      int(a.get("excluded_by_island", 0)),
+            "Extended Postcodes":     int(a.get("extended_postcodes", 0)),
+            "Extended Pop.":          int(a.get("extended_population", 0)),
         })
     return pd.DataFrame(rows)
 
@@ -622,6 +624,27 @@ with tab_cross:
             key="cb_min_cluster_population",
         )
 
+    extension_radius = st.number_input(
+        f"Extend dense clusters beyond radius, up to ({cb_radius_unit})",
+        min_value=0.0,
+        value=0.0,
+        step=1.0,
+        help="A cluster that survives the filters above and reaches the outer radius "
+             "may keep growing past it, through postcodes that are still linked "
+             "(within the cluster link distance) and still meet the density/population "
+             "filters, up to this extra distance. A dense pocket that never reaches the "
+             "outer radius still doesn't qualify on its own. 0 = don't extend "
+             "(hard cutoff at the outer radius). Requires cluster link distance above 0.",
+        key="cb_extension_radius",
+    )
+    if extension_radius > 0 and cluster_link_radius <= 0:
+        st.warning("Extension has no effect while cluster link distance is 0 (island filter off).")
+    elif extension_radius > 0:
+        st.caption(
+            f"Dense, connected clusters may reach up to "
+            f"**{outer_radius + extension_radius:.1f} {cb_radius_unit}** from the entry point."
+        )
+
     run_disabled = len(selected_names) == 0
     if run_disabled:
         st.info("Select at least one entry point to run.")
@@ -649,6 +672,7 @@ with tab_cross:
                 cluster_link_radius=float(cluster_link_radius) if cluster_link_radius > 0 else None,
                 min_cluster_postcodes=int(min_cluster_postcodes),
                 min_cluster_population=float(min_cluster_population),
+                extension_radius=float(extension_radius),
                 create_map_output=True,
                 map_filename="Cross_Border_Map.html",
             )

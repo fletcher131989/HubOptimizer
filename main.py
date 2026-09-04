@@ -1903,10 +1903,15 @@ def _empty_cross_border_result(airport):
         "excluded_by_min_population": 0,
         "excluded_by_max_density": 0,
         "excluded_by_island": 0,
+        "extended_postcodes": 0,
+        "extended_population": 0.0,
     }
 
 
-def island_filter_mask(lats, lons, populations, link_radius_km, min_cluster_postcodes=1, min_cluster_population=0.0):
+def island_filter_mask(
+    lats, lons, populations, link_radius_km, min_cluster_postcodes=1,
+    min_cluster_population=0.0, core_mask=None,
+):
     """
     Group points into clusters, where two points are linked (transitively) if
     they're within roughly link_radius_km of each other, then keep only
@@ -1917,6 +1922,14 @@ def island_filter_mask(lats, lons, populations, link_radius_km, min_cluster_post
     clear a density/population threshold but sit isolated from the rest of
     the qualifying area, which would mean an inefficient dead-leg trip to
     reach them rather than an efficient local delivery run.
+
+    If `core_mask` is given (a boolean array aligned with lats/lons), a
+    cluster is additionally required to contain at least one core point to
+    be kept. This is how dense clusters are allowed to extend past a search
+    radius: points beyond the radius are passed in alongside the in-radius
+    ("core") points, and only clusters actually anchored inside the radius
+    survive -- a wholly separate dense pocket entirely beyond the radius
+    still gets dropped.
 
     Clustering is done on a fixed spatial grid (cell size = link_radius_km,
     connecting each occupied cell to its 8 neighbours) rather than an exact
@@ -1988,6 +2001,11 @@ def island_filter_mask(lats, lons, populations, link_radius_km, min_cluster_post
     cluster_ok = (cluster_postcode_counts >= min_cluster_postcodes) & (
         cluster_populations >= min_cluster_population
     )
+    if core_mask is not None:
+        core_mask = np.asarray(core_mask, dtype=bool)
+        cluster_has_core = np.zeros(n_clusters, dtype=bool)
+        cluster_has_core[np.unique(cluster_labels[core_mask])] = True
+        cluster_ok &= cluster_has_core
     return cluster_ok[cluster_labels]
 
 
@@ -2004,6 +2022,7 @@ def evaluate_cross_border_airports(
     cluster_link_radius_km=None,
     min_cluster_postcodes=1,
     min_cluster_population=0.0,
+    extension_radius_km=0.0,
 ):
     """
     For each airport, find postcodes within `outer_radius_km` of it whose local
@@ -2015,6 +2034,18 @@ def evaluate_cross_border_airports(
     Density (and the optional per-postcode population/density caps) is
     expressed per unit of `circle_radius_display`'s squared unit, e.g. people
     per square mile when the UI is set to miles.
+
+    If `extension_radius_km` is set (and `cluster_link_radius_km` is also
+    set, since extension only makes sense in terms of a cluster), a cluster
+    that is dense/connected enough to survive the island filter and that
+    reaches the outer radius may extend past it by up to
+    `extension_radius_km`, provided the extra postcodes are themselves
+    linked (within `cluster_link_radius_km`) and still meet the density/
+    population filters. This runs after the initial radius+island filtering
+    and lets a hub pick up the parts of a neighbouring dense pocket a local
+    delivery run would naturally reach, rather than hard-cutting at the
+    catchment radius. A dense pocket that never reaches the outer radius at
+    all still doesn't qualify on its own.
 
     Postcodes are attributed to the first airport (in `airports` order) that
     covers them, mirroring the net-new/overlap accounting used for hubs.
@@ -2030,7 +2061,9 @@ def evaluate_cross_border_airports(
     density_col = f"Local Density (per sq {'mi' if use_miles else 'km'})"
     map_cols = ["Postcode", "Lat", "Lon", "Population", density_col, "Airport", "Airport Code", dist_col]
 
-    search_radius_km = outer_radius_km + circle_radius_km
+    extend_km = float(extension_radius_km) if (extension_radius_km and cluster_link_radius_km) else 0.0
+    candidate_radius_km = outer_radius_km + extend_km
+    search_radius_km = candidate_radius_km + circle_radius_km
 
     airport_results = []
     covered_postcodes = set()
@@ -2057,6 +2090,10 @@ def evaluate_cross_border_airports(
             airport_results.append(_empty_cross_border_result(airport))
             continue
 
+        candidate_idx = (
+            np.where(dist_to_airport_km <= candidate_radius_km)[0] if extend_km > 0 else eligible_idx
+        )
+
         populations = nearby_df["population"].to_numpy(dtype=np.float32)
 
         for pc, pop in zip(
@@ -2068,17 +2105,17 @@ def evaluate_cross_border_airports(
             nearby_df["lat"].to_numpy(dtype=np.float64),
             nearby_df["lon"].to_numpy(dtype=np.float64),
             populations,
-            eligible_idx,
+            candidate_idx,
             circle_radius_km,
         )
         local_density = local_population / area
 
         qualifies = local_density >= density_threshold
-        eligible_own_population = populations[eligible_idx]
+        candidate_own_population = populations[candidate_idx]
 
         excluded_min_pop = 0
         if min_population_per_postcode is not None:
-            fails = qualifies & (eligible_own_population < min_population_per_postcode)
+            fails = qualifies & (candidate_own_population < min_population_per_postcode)
             excluded_min_pop = int(fails.sum())
             qualifies &= ~fails
 
@@ -2088,10 +2125,11 @@ def evaluate_cross_border_airports(
             excluded_max_density = int(fails.sum())
             qualifies &= ~fails
 
-        qualifying_idx = eligible_idx[qualifies]
+        qualifying_idx = candidate_idx[qualifies]
 
         excluded_by_island = 0
         if cluster_link_radius_km and cluster_link_radius_km > 0 and len(qualifying_idx) > 0:
+            core_mask = dist_to_airport_km[qualifying_idx] <= outer_radius_km
             keep_mask = island_filter_mask(
                 nearby_df["lat"].to_numpy(dtype=np.float64)[qualifying_idx],
                 nearby_df["lon"].to_numpy(dtype=np.float64)[qualifying_idx],
@@ -2099,14 +2137,19 @@ def evaluate_cross_border_airports(
                 link_radius_km=cluster_link_radius_km,
                 min_cluster_postcodes=min_cluster_postcodes,
                 min_cluster_population=min_cluster_population,
+                core_mask=core_mask,
             )
             excluded_by_island = int((~keep_mask).sum())
             if excluded_by_island > 0:
                 # Fold the island exclusion back into `qualifies` so it stays
-                # aligned with local_density/eligible_idx for everything below.
+                # aligned with local_density/candidate_idx for everything below.
                 qualifying_positions = np.where(qualifies)[0]
                 qualifies[qualifying_positions[~keep_mask]] = False
-                qualifying_idx = eligible_idx[qualifies]
+                qualifying_idx = candidate_idx[qualifies]
+
+        extended_mask = dist_to_airport_km[qualifying_idx] > outer_radius_km
+        extended_postcodes = int(extended_mask.sum())
+        extended_population = float(populations[qualifying_idx][extended_mask].sum())
 
         potential_population = float(populations[qualifying_idx].sum())
         potential_postcodes = int(len(qualifying_idx))
@@ -2148,7 +2191,7 @@ def evaluate_cross_border_airports(
             "lat": float(lat),
             "lon": float(lon),
             "eligible_postcodes": int(len(eligible_idx)),
-            "eligible_population": float(eligible_own_population.sum()),
+            "eligible_population": float(populations[eligible_idx].sum()),
             "postcodes": new_postcode_count,
             "population": new_population,
             "potential_postcodes": potential_postcodes,
@@ -2157,6 +2200,8 @@ def evaluate_cross_border_airports(
             "excluded_by_min_population": excluded_min_pop,
             "excluded_by_max_density": excluded_max_density,
             "excluded_by_island": excluded_by_island,
+            "extended_postcodes": extended_postcodes,
+            "extended_population": extended_population,
         })
 
     multi_df = (
@@ -2217,6 +2262,7 @@ def create_cross_border_map(
     unit,
     covered_df,
     output_file="Cross_Border_Map.html",
+    extension_radius_km=0.0,
 ):
     if not airports:
         raise ValueError("At least one airport must be selected.")
@@ -2228,6 +2274,8 @@ def create_cross_border_map(
 
     use_miles = unit.lower() in ("mile", "miles", "mi")
     outer_radius_display = outer_radius_km / KM_PER_MILE if use_miles else outer_radius_km
+    max_reach_km = outer_radius_km + extension_radius_km
+    max_reach_display = max_reach_km / KM_PER_MILE if use_miles else max_reach_km
 
     for i, airport in enumerate(airports):
         color = HUB_COLORS[i % len(HUB_COLORS)]
@@ -2247,6 +2295,20 @@ def create_cross_border_map(
             weight=2,
             popup=f"{airport['name']} catchment radius: {outer_radius_display:.1f} {unit}",
         ).add_to(m)
+
+        if extension_radius_km > 0:
+            folium.Circle(
+                [airport["lat"], airport["lon"]],
+                radius=max_reach_km * 1000,
+                color=color,
+                fill=False,
+                weight=1,
+                dash_array="6, 6",
+                popup=(
+                    f"{airport['name']} max reach with cluster extension: "
+                    f"{max_reach_display:.1f} {unit}"
+                ),
+            ).add_to(m)
 
     if covered_df is not None and not covered_df.empty:
         heat_df = _aggregate_points_for_heatmap(covered_df)
@@ -2271,6 +2333,7 @@ def run_cross_border_optimisation(
     cluster_link_radius=None,
     min_cluster_postcodes=1,
     min_cluster_population=0.0,
+    extension_radius=0.0,
     create_map_output=True,
     map_filename="Cross_Border_Map.html",
 ):
@@ -2284,6 +2347,7 @@ def run_cross_border_optimisation(
     cluster_link_radius_km = (
         convert_to_km(cluster_link_radius, radius_unit) if cluster_link_radius else None
     )
+    extension_radius_km = convert_to_km(extension_radius, radius_unit) if extension_radius else 0.0
 
     df = load_postcode_data()
 
@@ -2301,6 +2365,7 @@ def run_cross_border_optimisation(
             cluster_link_radius_km=cluster_link_radius_km,
             min_cluster_postcodes=min_cluster_postcodes,
             min_cluster_population=min_cluster_population,
+            extension_radius_km=extension_radius_km,
         )
     )
 
@@ -2324,6 +2389,7 @@ def run_cross_border_optimisation(
             unit=radius_unit,
             covered_df=covered_map_df,
             output_file=map_filename,
+            extension_radius_km=extension_radius_km,
         )
 
     return {
@@ -2338,6 +2404,7 @@ def run_cross_border_optimisation(
         "cluster_link_radius": cluster_link_radius,
         "min_cluster_postcodes": min_cluster_postcodes,
         "min_cluster_population": min_cluster_population,
+        "extension_radius": extension_radius,
         "total_population": total_eligible_population,
         "covered_population": covered_population,
         "coverage_pct": coverage_pct,
