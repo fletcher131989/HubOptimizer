@@ -1,5 +1,5 @@
-import base64
 import json
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -193,12 +193,9 @@ def render_results(result, map_filename="user_polygon_result.html"):
 
     st.caption("Map output saved to `user_polygon_result.html`.")
     st.markdown("#### Coverage Map")
-    try:
-        with open(map_filename, "r", encoding="utf-8") as f:
-            map_html = f.read()
-        encoded = base64.b64encode(map_html.encode()).decode()
-        st.iframe(f"data:text/html;base64,{encoded}", height=550)
-    except FileNotFoundError:
+    if Path(map_filename).exists():
+        st.iframe(map_filename, height=550)
+    else:
         st.warning("Map file not found — it may not have been generated.")
 
 
@@ -219,6 +216,7 @@ def build_cross_border_results_df(airport_results):
             "Overlap %":              f"{overlap_pct:.1f}%",
             "Excluded (min pop)":     int(a["excluded_by_min_population"]),
             "Excluded (max density)": int(a["excluded_by_max_density"]),
+            "Excluded (island)":      int(a.get("excluded_by_island", 0)),
         })
     return pd.DataFrame(rows)
 
@@ -244,12 +242,9 @@ def render_cross_border_results(result, map_filename="Cross_Border_Map.html"):
 
     st.caption(f"Map output saved to `{map_filename}`.")
     st.markdown("#### Coverage Map")
-    try:
-        with open(map_filename, "r", encoding="utf-8") as f:
-            map_html = f.read()
-        encoded = base64.b64encode(map_html.encode()).decode()
-        st.iframe(f"data:text/html;base64,{encoded}", height=550)
-    except FileNotFoundError:
+    if Path(map_filename).exists():
+        st.iframe(map_filename, height=550)
+    else:
         st.warning("Map file not found — it may not have been generated.")
 
 
@@ -500,16 +495,6 @@ with tab_cross:
         key="cb_freight_filter",
     )
 
-    if "cb_airport_names" not in st.session_state:
-        st.session_state["cb_airport_names"] = [
-            a["name"] for a in airports if a["freight_importance"] in quick_filter
-        ]
-
-    if st.button("Apply freight filter to selection"):
-        st.session_state["cb_airport_names"] = [
-            a["name"] for a in airports if a["freight_importance"] in quick_filter
-        ]
-
     airport_options = [
         f'{a["name"]} ({a["code"]}) — Freight: {a["freight_importance"]}, Passenger: {a["passenger_importance"]}'
         for a in airports
@@ -517,14 +502,29 @@ with tab_cross:
     name_by_option = {opt: a["name"] for opt, a in zip(airport_options, airports)}
     option_by_name = {a["name"]: opt for opt, a in zip(airport_options, airports)}
 
+    # The multiselect below owns "cb_selected_options" via key=. We only ever
+    # write to that session_state entry *before* the widget is instantiated
+    # (seeding it here, or from the quick-filter button below) -- never after,
+    # and never alongside a `default=` on the same widget. Doing both (as this
+    # code used to) is a documented Streamlit anti-pattern that desyncs the
+    # frontend/backend state and makes every add/remove need two clicks.
+    if "cb_selected_options" not in st.session_state:
+        st.session_state["cb_selected_options"] = [
+            option_by_name[a["name"]] for a in airports if a["freight_importance"] in quick_filter
+        ]
+
+    if st.button("Apply freight filter to selection"):
+        st.session_state["cb_selected_options"] = [
+            option_by_name[a["name"]] for a in airports if a["freight_importance"] in quick_filter
+        ]
+
     selected_options = st.multiselect(
         "Selected entry points",
         options=airport_options,
-        default=[option_by_name[n] for n in st.session_state["cb_airport_names"] if n in option_by_name],
+        key="cb_selected_options",
         help="Currently UK airports only — ports will be added in future.",
     )
     selected_names = [name_by_option[o] for o in selected_options]
-    st.session_state["cb_airport_names"] = selected_names
 
     st.markdown("#### Catchment Settings")
 
@@ -581,6 +581,47 @@ with tab_cross:
             key="cb_density_threshold",
         )
 
+    st.markdown("#### Route Efficiency (remove isolated postcodes)")
+    st.caption(
+        "Qualifying postcodes are grouped into clusters — two postcodes are linked "
+        "(transitively) if they're within the link distance below of each other. "
+        "Clusters smaller than the minimums are dropped entirely, even if their "
+        "postcodes individually passed the filters above — this stops small, "
+        "disconnected pockets from forcing an inefficient dead-leg trip."
+    )
+
+    cb_e1, cb_e2, cb_e3 = st.columns(3)
+    with cb_e1:
+        cluster_link_radius = st.number_input(
+            f"Cluster link distance ({cb_radius_unit})",
+            min_value=0.0,
+            value=0.5,
+            step=0.5,
+            help="Two qualifying postcodes are treated as part of the same cluster if "
+                 "within this distance of each other. 0 = don't check connectivity "
+                 "(island filter off). A common starting point is the petal run radius.",
+            key="cb_cluster_link_radius",
+        )
+    with cb_e2:
+        min_cluster_postcodes = st.number_input(
+            "Minimum postcodes per cluster",
+            min_value=1,
+            value=6,
+            step=5,
+            help="Clusters with fewer postcodes than this are dropped entirely. "
+                 "1 = keep every cluster, including single isolated postcodes.",
+            key="cb_min_cluster_postcodes",
+        )
+    with cb_e3:
+        min_cluster_population = st.number_input(
+            "Minimum population per cluster",
+            min_value=0.0,
+            value=2000.0,
+            step=100.0,
+            help="Clusters with less total population than this are dropped. 0 = no minimum.",
+            key="cb_min_cluster_population",
+        )
+
     run_disabled = len(selected_names) == 0
     if run_disabled:
         st.info("Select at least one entry point to run.")
@@ -605,6 +646,9 @@ with tab_cross:
                 density_threshold=float(density_threshold),
                 radius_unit=cb_radius_unit,
                 min_population_per_postcode=float(min_population_per_postcode),
+                cluster_link_radius=float(cluster_link_radius) if cluster_link_radius > 0 else None,
+                min_cluster_postcodes=int(min_cluster_postcodes),
+                min_cluster_population=float(min_cluster_population),
                 create_map_output=True,
                 map_filename="Cross_Border_Map.html",
             )

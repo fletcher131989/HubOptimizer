@@ -4,3 +4,5 @@ scikit-learn==1.8.0
 folium==0.20.0
 streamlit==1.56.0
 streamlit-folium==0.27.1
+pg8000==1.31.2
+python-dotenv==1.1.0

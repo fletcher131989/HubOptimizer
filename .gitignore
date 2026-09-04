@@ -6,3 +6,4 @@ Hub Map Archive
 postcode_data/
 __pycache__/
 .venv/
+.env

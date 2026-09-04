@@ -1902,7 +1902,93 @@ def _empty_cross_border_result(airport):
         "overlap_population": 0.0,
         "excluded_by_min_population": 0,
         "excluded_by_max_density": 0,
+        "excluded_by_island": 0,
     }
+
+
+def island_filter_mask(lats, lons, populations, link_radius_km, min_cluster_postcodes=1, min_cluster_population=0.0):
+    """
+    Group points into clusters, where two points are linked (transitively) if
+    they're within roughly link_radius_km of each other, then keep only
+    points whose cluster has at least min_cluster_postcodes members and at
+    least min_cluster_population total population.
+
+    This removes "islands" -- small pockets of postcodes that individually
+    clear a density/population threshold but sit isolated from the rest of
+    the qualifying area, which would mean an inefficient dead-leg trip to
+    reach them rather than an efficient local delivery run.
+
+    Clustering is done on a fixed spatial grid (cell size = link_radius_km,
+    connecting each occupied cell to its 8 neighbours) rather than an exact
+    point-to-point BallTree radius query. An exact query is O(N x
+    neighbours-per-point), which is unbounded in dense city centres -- the
+    same failure mode already hit and fixed for the petal-run density calc.
+    The grid/union-find approach here is bounded by the number of distinct
+    grid cells (i.e. the geographic extent of the data), independent of how
+    many postcodes fall in any one of them.
+    """
+    n = len(lats)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if link_radius_km <= 0:
+        return np.ones(n, dtype=bool)
+
+    lat0 = float(np.mean(lats))
+    lon0 = float(np.mean(lons))
+    x_km = (lons - lon0) * 111.320 * np.cos(np.radians(lat0))
+    y_km = (lats - lat0) * 110.574
+
+    cell_km = link_radius_km
+    col_idx = np.floor(x_km / cell_km).astype(np.int64)
+    row_idx = np.floor(y_km / cell_km).astype(np.int64)
+
+    # Union-find over distinct occupied (row, col) cells only.
+    occupied_cells = {}
+    for r, c in zip(row_idx, col_idx):
+        key = (int(r), int(c))
+        if key not in occupied_cells:
+            occupied_cells[key] = len(occupied_cells)
+
+    n_cells = len(occupied_cells)
+    parent = list(range(n_cells))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for (r, c), cell_local_id in occupied_cells.items():
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                neighbor_local_id = occupied_cells.get((r + dr, c + dc))
+                if neighbor_local_id is not None:
+                    union(cell_local_id, neighbor_local_id)
+
+    cell_root = np.array([find(i) for i in range(n_cells)])
+    point_cell_local_id = np.fromiter(
+        (occupied_cells[(int(r), int(c))] for r, c in zip(row_idx, col_idx)),
+        dtype=np.int64, count=n,
+    )
+    point_root = cell_root[point_cell_local_id]
+
+    _, cluster_labels = np.unique(point_root, return_inverse=True)
+    n_clusters = int(cluster_labels.max()) + 1 if n else 0
+
+    cluster_postcode_counts = np.bincount(cluster_labels, minlength=n_clusters)
+    cluster_populations = np.bincount(cluster_labels, weights=populations, minlength=n_clusters)
+
+    cluster_ok = (cluster_postcode_counts >= min_cluster_postcodes) & (
+        cluster_populations >= min_cluster_population
+    )
+    return cluster_ok[cluster_labels]
 
 
 def evaluate_cross_border_airports(
@@ -1915,6 +2001,9 @@ def evaluate_cross_border_airports(
     radius_unit="miles",
     min_population_per_postcode=None,
     max_density_per_postcode=None,
+    cluster_link_radius_km=None,
+    min_cluster_postcodes=1,
+    min_cluster_population=0.0,
 ):
     """
     For each airport, find postcodes within `outer_radius_km` of it whose local
@@ -2000,6 +2089,25 @@ def evaluate_cross_border_airports(
             qualifies &= ~fails
 
         qualifying_idx = eligible_idx[qualifies]
+
+        excluded_by_island = 0
+        if cluster_link_radius_km and cluster_link_radius_km > 0 and len(qualifying_idx) > 0:
+            keep_mask = island_filter_mask(
+                nearby_df["lat"].to_numpy(dtype=np.float64)[qualifying_idx],
+                nearby_df["lon"].to_numpy(dtype=np.float64)[qualifying_idx],
+                populations[qualifying_idx],
+                link_radius_km=cluster_link_radius_km,
+                min_cluster_postcodes=min_cluster_postcodes,
+                min_cluster_population=min_cluster_population,
+            )
+            excluded_by_island = int((~keep_mask).sum())
+            if excluded_by_island > 0:
+                # Fold the island exclusion back into `qualifies` so it stays
+                # aligned with local_density/eligible_idx for everything below.
+                qualifying_positions = np.where(qualifies)[0]
+                qualifies[qualifying_positions[~keep_mask]] = False
+                qualifying_idx = eligible_idx[qualifies]
+
         potential_population = float(populations[qualifying_idx].sum())
         potential_postcodes = int(len(qualifying_idx))
 
@@ -2048,6 +2156,7 @@ def evaluate_cross_border_airports(
             "overlap_population": potential_population - new_population,
             "excluded_by_min_population": excluded_min_pop,
             "excluded_by_max_density": excluded_max_density,
+            "excluded_by_island": excluded_by_island,
         })
 
     multi_df = (
@@ -2073,6 +2182,33 @@ def evaluate_cross_border_airports(
     total_eligible_population = float(sum(eligible_population_by_postcode.values()))
 
     return airport_results, covered_postcodes, multi_df, single_df, total_eligible_population
+
+
+def _aggregate_points_for_heatmap(df, max_points=20_000):
+    """
+    Collapse a (lat, lon, population) dataframe onto a coarse grid so a
+    Folium HeatMap layer stays a manageable size. Plotting one point per raw
+    postcode can mean millions of entries for a large cross-border run
+    (e.g. several "Major" freight airports at once), producing a many-tens-
+    of-MB HTML file that hangs or fails to render in the browser. Coarsening
+    to whatever grid resolution keeps the point count under `max_points`
+    fixes that while still giving a faithful visual heatmap.
+    """
+    if df.empty:
+        return df
+
+    for cell_deg in (0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0):
+        lat_bin = (df["lat"] / cell_deg).round().astype(int)
+        lon_bin = (df["lon"] / cell_deg).round().astype(int)
+        grouped = (
+            df.assign(_lat_bin=lat_bin, _lon_bin=lon_bin)
+            .groupby(["_lat_bin", "_lon_bin"], as_index=False)
+            .agg(lat=("lat", "mean"), lon=("lon", "mean"), population=("population", "sum"))
+        )
+        if len(grouped) <= max_points:
+            break
+
+    return grouped[["lat", "lon", "population"]]
 
 
 def create_cross_border_map(
@@ -2113,7 +2249,8 @@ def create_cross_border_map(
         ).add_to(m)
 
     if covered_df is not None and not covered_df.empty:
-        heat_data = covered_df[["lat", "lon", "population"]].values.tolist()
+        heat_df = _aggregate_points_for_heatmap(covered_df)
+        heat_data = heat_df[["lat", "lon", "population"]].values.tolist()
         HeatMap(
             heat_data, radius=8, blur=6, max_zoom=11, name="Covered postcodes (by population)"
         ).add_to(m)
@@ -2131,6 +2268,9 @@ def run_cross_border_optimisation(
     radius_unit="miles",
     min_population_per_postcode=None,
     max_density_per_postcode=None,
+    cluster_link_radius=None,
+    min_cluster_postcodes=1,
+    min_cluster_population=0.0,
     create_map_output=True,
     map_filename="Cross_Border_Map.html",
 ):
@@ -2141,6 +2281,9 @@ def run_cross_border_optimisation(
 
     outer_radius_km = convert_to_km(outer_radius, radius_unit)
     circle_radius_km = convert_to_km(circle_radius, radius_unit)
+    cluster_link_radius_km = (
+        convert_to_km(cluster_link_radius, radius_unit) if cluster_link_radius else None
+    )
 
     df = load_postcode_data()
 
@@ -2155,6 +2298,9 @@ def run_cross_border_optimisation(
             radius_unit=radius_unit,
             min_population_per_postcode=min_population_per_postcode,
             max_density_per_postcode=max_density_per_postcode,
+            cluster_link_radius_km=cluster_link_radius_km,
+            min_cluster_postcodes=min_cluster_postcodes,
+            min_cluster_population=min_cluster_population,
         )
     )
 
@@ -2189,6 +2335,9 @@ def run_cross_border_optimisation(
         "density_threshold": density_threshold,
         "min_population_per_postcode": min_population_per_postcode,
         "max_density_per_postcode": max_density_per_postcode,
+        "cluster_link_radius": cluster_link_radius,
+        "min_cluster_postcodes": min_cluster_postcodes,
+        "min_cluster_population": min_cluster_population,
         "total_population": total_eligible_population,
         "covered_population": covered_population,
         "coverage_pct": coverage_pct,
