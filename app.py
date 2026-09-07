@@ -207,6 +207,7 @@ def build_cross_border_results_df(airport_results):
         rows.append({
             "Airport":                a["airport_name"],
             "Code":                   a["airport_code"],
+            "Relay Of":               a.get("relay_parent_name") or "",
             "Radius":                 a.get("outer_radius", 0.0),
             "Petal Radius":           a.get("circle_radius", 0.0),
             "Overridden":             bool(a.get("is_overridden", False)),
@@ -230,11 +231,17 @@ def render_cross_border_results(result, map_filename="Cross_Border_Map.html"):
     st.markdown("---")
     st.subheader("Results")
 
-    c1, c2, c3, c4 = st.columns(4)
+    relay_count = sum(1 for a in result["airports"] if a.get("relay_parent_name"))
+    airport_count = len(result["airports"]) - relay_count
+
+    cols = st.columns(5 if relay_count else 4)
+    c1, c2, c3, c4 = cols[:4]
     c1.metric("Eligible Population (in radius)", f"{result['total_population']:,.0f}")
     c2.metric("Qualifying Population",            f"{result['covered_population']:,.0f}")
     c3.metric("Qualifying %",                     f"{result['coverage_pct']:.1f}%")
-    c4.metric("Airports Used",                    str(len(result["airports"])))
+    c4.metric("Airports Used",                    str(airport_count))
+    if relay_count:
+        cols[4].metric("Relay Hubs Used", str(relay_count))
 
     if "england_scotland_population" in result:
         c5, c6 = st.columns(2)
@@ -251,10 +258,12 @@ def render_cross_border_results(result, map_filename="Cross_Border_Map.html"):
             help="Qualifying population as a share of the England & Scotland total above.",
         )
 
-    multi_df = result.get("multi_hub_df", pd.DataFrame())
-    single_df = result.get("single_hub_df", pd.DataFrame())
+    multi_df = result.get("multi_hub_df_export", result.get("multi_hub_df", pd.DataFrame()))
+    single_df = result.get("single_hub_df_export", result.get("single_hub_df", pd.DataFrame()))
     if not multi_df.empty:
         st.markdown("#### Download Covered Postcodes")
+        if result.get("relay_hubs"):
+            st.caption("Relay hubs' postcodes are reported under their parent airport in these downloads.")
         download_buttons(multi_df, single_df, key_prefix="cb_top")
 
     st.markdown("#### Airport Summary")
@@ -617,6 +626,58 @@ with tab_cross:
         else:
             st.caption("Select at least one entry point above to set overrides.")
 
+    relay_hubs = []
+    with st.expander("Relay hubs (optional)", expanded=True):
+        st.caption(
+            "Add an extra entry point that's evaluated exactly like a selected airport "
+            "above — its own catchment radius, density and route-efficiency filters, its "
+            "own marker on the map — for example a hub placed between two airports to "
+            "reach the area in between. The only difference: when you download the "
+            "covered-postcode mapping, a relay's postcodes are reported under its parent "
+            "airport instead of the relay itself, since the relay is a fulfilment detail, "
+            "not a separate customs/entry point."
+        )
+        if selected_names:
+            relay_editor_df = pd.DataFrame({
+                "Name": pd.Series(dtype="str"),
+                "Lat": pd.Series(dtype="float"),
+                "Lon": pd.Series(dtype="float"),
+                "Parent Airport": pd.Series(dtype="str"),
+            })
+            edited_relays_df = st.data_editor(
+                relay_editor_df,
+                column_config={
+                    "Name": st.column_config.TextColumn("Relay name", required=True),
+                    "Lat": st.column_config.NumberColumn(
+                        "Latitude", min_value=49.0, max_value=61.0, format="%.5f", required=True
+                    ),
+                    "Lon": st.column_config.NumberColumn(
+                        "Longitude", min_value=-8.0, max_value=2.0, format="%.5f", required=True
+                    ),
+                    "Parent Airport": st.column_config.SelectboxColumn(
+                        "Parent airport", options=selected_names, required=True
+                    ),
+                },
+                hide_index=True,
+                width="stretch",
+                num_rows="dynamic",
+                key="cb_relay_editor",
+            )
+            name_to_code_relay = {a["name"]: a["code"] for a in airports}
+            for _, row in edited_relays_df.iterrows():
+                if not str(row["Name"] or "").strip():
+                    continue
+                if pd.isna(row["Lat"]) or pd.isna(row["Lon"]) or not row["Parent Airport"]:
+                    continue
+                relay_hubs.append({
+                    "name": str(row["Name"]).strip(),
+                    "lat": float(row["Lat"]),
+                    "lon": float(row["Lon"]),
+                    "parent_code": name_to_code_relay[row["Parent Airport"]],
+                })
+        else:
+            st.caption("Select at least one entry point above to add relay hubs.")
+
     st.markdown("#### Density / Volume Filters")
 
     cb_d1, cb_d2 = st.columns(2)
@@ -624,7 +685,7 @@ with tab_cross:
         min_population_per_postcode = st.number_input(
             "Minimum population per postcode",
             min_value=0.0,
-            value=0.0,
+            value=50.0,
             step=10.0,
             help="Postcodes with fewer people than this are excluded. 0 = no filter.",
             key="cb_min_population",
@@ -633,7 +694,7 @@ with tab_cross:
         density_threshold = st.number_input(
             f"Minimum local density (people per sq {cb_radius_unit})",
             min_value=0.0,
-            value=0.0,
+            value=200.0,
             step=50.0,
             help=(
                 f"A postcode's local density is the population within the petal run radius of it, "
@@ -667,7 +728,7 @@ with tab_cross:
         min_cluster_postcodes = st.number_input(
             "Minimum postcodes per cluster",
             min_value=1,
-            value=6,
+            value=11,
             step=5,
             help="Clusters with fewer postcodes than this are dropped entirely. "
                  "1 = keep every cluster, including single isolated postcodes.",
@@ -683,25 +744,54 @@ with tab_cross:
             key="cb_min_cluster_population",
         )
 
-    extension_radius = st.number_input(
-        f"Extend dense clusters beyond radius, up to ({cb_radius_unit})",
-        min_value=0.0,
-        value=0.0,
-        step=1.0,
-        help="A cluster that survives the filters above and reaches the outer radius "
-             "may keep growing past it, through postcodes that are still linked "
-             "(within the cluster link distance) and still meet the density/population "
-             "filters, up to this extra distance. A dense pocket that never reaches the "
-             "outer radius still doesn't qualify on its own. 0 = don't extend "
-             "(hard cutoff at the outer radius). Requires cluster link distance above 0.",
-        key="cb_extension_radius",
-    )
+    cb_ext1, cb_ext2 = st.columns(2)
+    with cb_ext1:
+        extension_radius = st.number_input(
+            f"Extend dense clusters beyond radius, up to ({cb_radius_unit})",
+            min_value=0.0,
+            value=10.0,
+            step=1.0,
+            help="A cluster that survives the filters above and reaches the outer radius "
+                 "may keep growing past it, through postcodes that are still linked "
+                 "(within the cluster link distance) and still meet the density/population "
+                 "filters, up to this extra distance. A dense pocket that never reaches the "
+                 "outer radius still doesn't qualify on its own. 0 = don't extend "
+                 "(hard cutoff at the outer radius). Requires cluster link distance above 0.",
+            key="cb_extension_radius",
+        )
+    with cb_ext2:
+        extension_link_radius = st.number_input(
+            f"Extension link distance (stricter, {cb_radius_unit})",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            help="A stricter, usually smaller version of the cluster link distance above, "
+                 "used only for connections beyond the outer radius: postcodes inside the "
+                 "radius still link at the normal distance, but reaching out into (or moving "
+                 "around within) the extension zone requires postcodes to be this close "
+                 "together instead. Lets you push the extension distance further to reach a "
+                 "genuinely tightly-packed neighbouring area (e.g. another city) without also "
+                 "bridging through a loosely-scattered corridor along the way. 0 = extension "
+                 "uses the same link distance as the core (no extra strictness).",
+            key="cb_extension_link_radius",
+        )
     if extension_radius > 0 and cluster_link_radius <= 0:
         st.warning("Extension has no effect while cluster link distance is 0 (island filter off).")
     elif extension_radius > 0:
+        if 0 < extension_link_radius < cluster_link_radius:
+            ext_note = (
+                f" Beyond the outer radius, postcodes must be within "
+                f"**{extension_link_radius:.2f} {cb_radius_unit}** of each other to stay linked "
+                f"(vs {cluster_link_radius:.2f} inside it)."
+            )
+        elif extension_link_radius >= cluster_link_radius > 0:
+            ext_note = " ⚠️ Extension link distance isn't smaller than the base cluster link distance, so it won't add any extra strictness."
+        else:
+            ext_note = ""
         st.caption(
             f"Dense, connected clusters may reach up to "
             f"**{outer_radius + extension_radius:.1f} {cb_radius_unit}** from the entry point."
+            + ext_note
         )
 
     run_disabled = len(selected_names) == 0
@@ -732,7 +822,11 @@ with tab_cross:
                 min_cluster_postcodes=int(min_cluster_postcodes),
                 min_cluster_population=float(min_cluster_population),
                 extension_radius=float(extension_radius),
+                extension_link_radius=(
+                    float(extension_link_radius) if extension_link_radius > 0 else None
+                ),
                 airport_overrides=airport_overrides,
+                relay_hubs=relay_hubs,
                 create_map_output=True,
                 map_filename="Cross_Border_Map.html",
             )

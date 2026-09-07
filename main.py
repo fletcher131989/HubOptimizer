@@ -1911,50 +1911,23 @@ def _empty_cross_border_result(airport, outer_radius_display=0.0, circle_radius_
     }
 
 
-def island_filter_mask(
-    lats, lons, populations, link_radius_km, min_cluster_postcodes=1,
-    min_cluster_population=0.0, core_mask=None,
-):
+def _grid_cluster_labels(x_km, y_km, cell_km):
     """
-    Group points into clusters, where two points are linked (transitively) if
-    they're within roughly link_radius_km of each other, then keep only
-    points whose cluster has at least min_cluster_postcodes members and at
-    least min_cluster_population total population.
-
-    This removes "islands" -- small pockets of postcodes that individually
-    clear a density/population threshold but sit isolated from the rest of
-    the qualifying area, which would mean an inefficient dead-leg trip to
-    reach them rather than an efficient local delivery run.
-
-    If `core_mask` is given (a boolean array aligned with lats/lons), a
-    cluster is additionally required to contain at least one core point to
-    be kept. This is how dense clusters are allowed to extend past a search
-    radius: points beyond the radius are passed in alongside the in-radius
-    ("core") points, and only clusters actually anchored inside the radius
-    survive -- a wholly separate dense pocket entirely beyond the radius
-    still gets dropped.
-
-    Clustering is done on a fixed spatial grid (cell size = link_radius_km,
+    Cluster the given points via a fixed spatial grid (cell size = cell_km,
     connecting each occupied cell to its 8 neighbours) rather than an exact
     point-to-point BallTree radius query. An exact query is O(N x
     neighbours-per-point), which is unbounded in dense city centres -- the
     same failure mode already hit and fixed for the petal-run density calc.
     The grid/union-find approach here is bounded by the number of distinct
     grid cells (i.e. the geographic extent of the data), independent of how
-    many postcodes fall in any one of them.
+    many points fall in any one of them.
+
+    Returns an int array of cluster labels, one per input point.
     """
-    n = len(lats)
+    n = len(x_km)
     if n == 0:
-        return np.zeros(0, dtype=bool)
-    if link_radius_km <= 0:
-        return np.ones(n, dtype=bool)
+        return np.zeros(0, dtype=np.int64)
 
-    lat0 = float(np.mean(lats))
-    lon0 = float(np.mean(lons))
-    x_km = (lons - lon0) * 111.320 * np.cos(np.radians(lat0))
-    y_km = (lats - lat0) * 110.574
-
-    cell_km = link_radius_km
     col_idx = np.floor(x_km / cell_km).astype(np.int64)
     row_idx = np.floor(y_km / cell_km).astype(np.int64)
 
@@ -1995,6 +1968,93 @@ def island_filter_mask(
     )
     point_root = cell_root[point_cell_local_id]
 
+    _, labels = np.unique(point_root, return_inverse=True)
+    return labels
+
+
+def island_filter_mask(
+    lats, lons, populations, link_radius_km, min_cluster_postcodes=1,
+    min_cluster_population=0.0, core_mask=None, extension_link_radius_km=None,
+):
+    """
+    Group points into clusters, where two points are linked (transitively) if
+    they're within roughly link_radius_km of each other, then keep only
+    points whose cluster has at least min_cluster_postcodes members and at
+    least min_cluster_population total population.
+
+    This removes "islands" -- small pockets of postcodes that individually
+    clear a density/population threshold but sit isolated from the rest of
+    the qualifying area, which would mean an inefficient dead-leg trip to
+    reach them rather than an efficient local delivery run.
+
+    If `core_mask` is given (a boolean array aligned with lats/lons), a
+    cluster is additionally required to contain at least one core point to
+    be kept. This is how dense clusters are allowed to extend past a search
+    radius: points beyond the radius are passed in alongside the in-radius
+    ("core") points, and only clusters actually anchored inside the radius
+    survive -- a wholly separate dense pocket entirely beyond the radius
+    still gets dropped.
+
+    If `extension_link_radius_km` is also given, it replaces link_radius_km
+    for any connection that touches a non-core point: core points still link
+    to each other at the normal link_radius_km, but linking a core point
+    onward into non-core territory, or linking two non-core points together,
+    requires this (typically tighter/smaller) distance instead. This is the
+    stricter, extension-specific counterpart to link_radius_km itself -- a
+    purely geometric "how close together" rule, not a per-point density or
+    population bar -- so a bigger search reach can still connect to a
+    genuinely tightly-packed neighbouring area without also bridging through
+    a loosely-scattered corridor along the way.
+    """
+    n = len(lats)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if link_radius_km <= 0:
+        return np.ones(n, dtype=bool)
+
+    lat0 = float(np.mean(lats))
+    lon0 = float(np.mean(lons))
+    x_km = (lons - lon0) * 111.320 * np.cos(np.radians(lat0))
+    y_km = (lats - lat0) * 110.574
+
+    # Final union-find over all n points, built by merging one or two grid
+    # clusterings (see docstring: core-core at link_radius_km, anything else
+    # at the stricter extension_link_radius_km when that's supplied).
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def merge_by_labels(point_indices, labels):
+        order = np.argsort(labels, kind="stable")
+        sorted_idx = point_indices[order]
+        sorted_labels = labels[order]
+        same_as_prev = np.nonzero(sorted_labels[1:] == sorted_labels[:-1])[0]
+        for i in same_as_prev:
+            union(int(sorted_idx[i]), int(sorted_idx[i + 1]))
+
+    if extension_link_radius_km is not None and core_mask is not None:
+        core_idx = np.where(np.asarray(core_mask, dtype=bool))[0]
+        if len(core_idx) > 0:
+            core_labels = _grid_cluster_labels(x_km[core_idx], y_km[core_idx], link_radius_km)
+            merge_by_labels(core_idx, core_labels)
+        all_idx = np.arange(n)
+        tight_labels = _grid_cluster_labels(x_km, y_km, extension_link_radius_km)
+        merge_by_labels(all_idx, tight_labels)
+    else:
+        all_idx = np.arange(n)
+        labels = _grid_cluster_labels(x_km, y_km, link_radius_km)
+        merge_by_labels(all_idx, labels)
+
+    point_root = np.array([find(i) for i in range(n)])
     _, cluster_labels = np.unique(point_root, return_inverse=True)
     n_clusters = int(cluster_labels.max()) + 1 if n else 0
 
@@ -2026,6 +2086,7 @@ def evaluate_cross_border_airports(
     min_cluster_postcodes=1,
     min_cluster_population=0.0,
     extension_radius_km=0.0,
+    extension_link_radius_km=None,
     airport_overrides=None,
 ):
     """
@@ -2058,6 +2119,19 @@ def evaluate_cross_border_airports(
     delivery run would naturally reach, rather than hard-cutting at the
     catchment radius. A dense pocket that never reaches the outer radius at
     all still doesn't qualify on its own.
+
+    `extension_link_radius_km`, if set, is a stricter (typically smaller)
+    version of `cluster_link_radius_km` used for any connection beyond the
+    outer radius: postcodes inside the radius still link to each other at
+    `cluster_link_radius_km`, but reaching out into -- or moving around
+    within -- the extension zone requires this tighter distance instead. It's
+    a purely geometric "how close together" rule (see `island_filter_mask`),
+    not a density or population bar. This lets a bigger `extension_radius_km`
+    reach a genuinely tightly-packed pocket a fair way out (e.g. a
+    neighbouring city) without also bridging through a loosely-scattered
+    corridor along the way. Left unset, extension uses the same
+    `cluster_link_radius_km` as the core (the original, more permissive
+    behaviour).
 
     Postcodes are attributed to the first airport (in `airports` order) that
     covers them, mirroring the net-new/overlap accounting used for hubs.
@@ -2166,6 +2240,9 @@ def evaluate_cross_border_airports(
                 min_cluster_postcodes=min_cluster_postcodes,
                 min_cluster_population=min_cluster_population,
                 core_mask=core_mask,
+                extension_link_radius_km=(
+                    extension_link_radius_km if extend_km > 0 else None
+                ),
             )
             excluded_by_island = int((~keep_mask).sum())
             if excluded_by_island > 0:
@@ -2318,11 +2395,20 @@ def create_cross_border_map(
             airport_max_reach_km / KM_PER_MILE if use_miles else airport_max_reach_km
         )
 
+        relay_parent_name = airport.get("relay_parent_name")
+        label = (
+            f"<b>{airport['name']}</b> (relay for {relay_parent_name})"
+            if relay_parent_name else f"<b>{airport['name']} ({airport['code']})</b>"
+        )
         folium.Marker(
             [airport["lat"], airport["lon"]],
-            popup=f"<b>{airport['name']} ({airport['code']})</b>",
-            tooltip=f"{airport['name']} ({airport['code']})",
-            icon=folium.Icon(color=color, icon="plane", prefix="fa"),
+            popup=label,
+            tooltip=label,
+            icon=folium.Icon(
+                color=color,
+                icon="link" if relay_parent_name else "plane",
+                prefix="fa",
+            ),
         ).add_to(m)
 
         folium.Circle(
@@ -2375,6 +2461,54 @@ def total_population_england_scotland(df):
     return float(df.loc[~area.isin(excluded), "population"].sum())
 
 
+def resolve_relay_export(df, relay_parent_info, radius_unit):
+    """
+    Rewrite a covered-postcodes dataframe (multi_hub_df / single_hub_df shape)
+    so that rows served by a relay hub show the relay's *parent* airport in
+    the Airport/Airport Code columns instead of the relay itself, and the
+    distance-to-airport column is recomputed against the parent's location
+    rather than the relay's -- a relay is a fulfilment/routing detail, but
+    the exported mapping should say which actual entry point the freight
+    clears through.
+
+    `relay_parent_info` is a dict keyed by relay code, values
+    {"parent_code", "parent_name", "parent_lat", "parent_lon"}. Rows for two
+    different entry points that collapse onto the same (Postcode, parent) pair
+    after remapping (e.g. a relay and its own parent both covering a postcode)
+    are de-duplicated, keeping the closer one.
+    """
+    if df.empty or not relay_parent_info:
+        return df
+
+    is_relay = df["Airport Code"].isin(relay_parent_info)
+    if not is_relay.any():
+        return df
+
+    out = df.copy()
+    info = out.loc[is_relay, "Airport Code"].map(relay_parent_info)
+    out.loc[is_relay, "Airport Code"] = info.map(lambda d: d["parent_code"])
+    out.loc[is_relay, "Airport"] = info.map(lambda d: d["parent_name"])
+
+    dist_col = next(c for c in out.columns if c.startswith("Distance to Airport"))
+    use_miles = radius_unit.lower() in ("mile", "miles", "mi")
+    parent_lat = info.map(lambda d: d["parent_lat"]).to_numpy(dtype=np.float64)
+    parent_lon = info.map(lambda d: d["parent_lon"]).to_numpy(dtype=np.float64)
+    dist_km = haversine_array(
+        parent_lat, parent_lon,
+        out.loc[is_relay, "Lat"].to_numpy(dtype=np.float64),
+        out.loc[is_relay, "Lon"].to_numpy(dtype=np.float64),
+    )
+    dist_display = dist_km / KM_PER_MILE if use_miles else dist_km
+    out.loc[is_relay, dist_col] = np.round(dist_display, 4)
+
+    return (
+        out.sort_values(dist_col)
+        .drop_duplicates(subset=["Postcode", "Airport Code"], keep="first")
+        .sort_values(["Airport Code", "Postcode"])
+        .reset_index(drop=True)
+    )
+
+
 def run_cross_border_optimisation(
     airport_codes,
     outer_radius,
@@ -2387,14 +2521,55 @@ def run_cross_border_optimisation(
     min_cluster_postcodes=1,
     min_cluster_population=0.0,
     extension_radius=0.0,
+    extension_link_radius=None,
     airport_overrides=None,
+    relay_hubs=None,
     create_map_output=True,
     map_filename="Cross_Border_Map.html",
 ):
+    """
+    Evaluate cross-border coverage for the given airports and produce the
+    covered-postcode dataframes and a coverage map.
+
+    `relay_hubs`, if given, is a list of {"name", "lat", "lon", "parent_code"}
+    dicts -- extra entry points (e.g. a hub between two airports) that are
+    evaluated exactly like a selected airport (their own catchment radius,
+    density filters, clustering/extension, and an optional entry in
+    `airport_overrides` keyed by their auto-assigned "RELAY<n>" code), and
+    show up in `airports`/the map/the results the same way. The only special
+    treatment is on export: `multi_hub_df_export`/`single_hub_df_export` in
+    the returned dict rewrite a relay's rows to show its `parent_code`
+    airport instead, since the relay is a fulfilment detail, not a separate
+    customs/entry point. `parent_code` must be one of `airport_codes`.
+    """
     all_airports = load_uk_airports()
     airports = [a for a in all_airports if a["code"] in airport_codes]
     if not airports:
         raise ValueError("At least one airport must be selected.")
+
+    parent_lookup = {a["code"]: a for a in airports}
+    relay_parent_info = {}
+    for i, relay in enumerate(relay_hubs or []):
+        parent = parent_lookup.get(relay["parent_code"])
+        if parent is None:
+            raise ValueError(
+                f"Relay '{relay['name']}' has an unknown parent airport code '{relay['parent_code']}'."
+            )
+        relay_code = f"RELAY{i + 1}"
+        airports.append({
+            "code": relay_code,
+            "name": relay["name"],
+            "lat": float(relay["lat"]),
+            "lon": float(relay["lon"]),
+            "relay_parent_code": parent["code"],
+            "relay_parent_name": parent["name"],
+        })
+        relay_parent_info[relay_code] = {
+            "parent_code": parent["code"],
+            "parent_name": parent["name"],
+            "parent_lat": float(parent["lat"]),
+            "parent_lon": float(parent["lon"]),
+        }
 
     outer_radius_km = convert_to_km(outer_radius, radius_unit)
     circle_radius_km = convert_to_km(circle_radius, radius_unit)
@@ -2402,6 +2577,9 @@ def run_cross_border_optimisation(
         convert_to_km(cluster_link_radius, radius_unit) if cluster_link_radius else None
     )
     extension_radius_km = convert_to_km(extension_radius, radius_unit) if extension_radius else 0.0
+    extension_link_radius_km = (
+        convert_to_km(extension_link_radius, radius_unit) if extension_link_radius else None
+    )
 
     airport_overrides_km = {}
     for code, ov in (airport_overrides or {}).items():
@@ -2431,9 +2609,18 @@ def run_cross_border_optimisation(
             min_cluster_postcodes=min_cluster_postcodes,
             min_cluster_population=min_cluster_population,
             extension_radius_km=extension_radius_km,
+            extension_link_radius_km=extension_link_radius_km,
             airport_overrides=airport_overrides_km,
         )
     )
+
+    for result in airport_results:
+        parent_info = relay_parent_info.get(result["airport_code"])
+        result["relay_parent_code"] = parent_info["parent_code"] if parent_info else None
+        result["relay_parent_name"] = parent_info["parent_name"] if parent_info else None
+
+    multi_df_export = resolve_relay_export(multi_df, relay_parent_info, radius_unit)
+    single_df_export = resolve_relay_export(single_df, relay_parent_info, radius_unit)
 
     covered_population = float(single_df["Population"].sum()) if not single_df.empty else 0.0
     coverage_pct = (
@@ -2478,7 +2665,9 @@ def run_cross_border_optimisation(
         "min_cluster_postcodes": min_cluster_postcodes,
         "min_cluster_population": min_cluster_population,
         "extension_radius": extension_radius,
+        "extension_link_radius": extension_link_radius,
         "airport_overrides": airport_overrides,
+        "relay_hubs": relay_hubs,
         "total_population": total_eligible_population,
         "covered_population": covered_population,
         "coverage_pct": coverage_pct,
@@ -2487,6 +2676,8 @@ def run_cross_border_optimisation(
         "covered_postcodes": covered_postcodes,
         "multi_hub_df": multi_df,
         "single_hub_df": single_df,
+        "multi_hub_df_export": multi_df_export,
+        "single_hub_df_export": single_df_export,
     }
 
 
