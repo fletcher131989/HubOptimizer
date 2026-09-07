@@ -207,6 +207,9 @@ def build_cross_border_results_df(airport_results):
         rows.append({
             "Airport":                a["airport_name"],
             "Code":                   a["airport_code"],
+            "Radius":                 a.get("outer_radius", 0.0),
+            "Petal Radius":           a.get("circle_radius", 0.0),
+            "Overridden":             bool(a.get("is_overridden", False)),
             "New Postcodes":          int(a["postcodes"]),
             "New Population":         int(a["population"]),
             "Eligible Postcodes":     int(a["eligible_postcodes"]),
@@ -232,6 +235,21 @@ def render_cross_border_results(result, map_filename="Cross_Border_Map.html"):
     c2.metric("Qualifying Population",            f"{result['covered_population']:,.0f}")
     c3.metric("Qualifying %",                     f"{result['coverage_pct']:.1f}%")
     c4.metric("Airports Used",                    str(len(result["airports"])))
+
+    if "england_scotland_population" in result:
+        c5, c6 = st.columns(2)
+        c5.metric(
+            "England & Scotland Population",
+            f"{result['england_scotland_population']:,.0f}",
+            help="Total population across every postcode classified as England or "
+                 "Scotland (Northern Ireland and Wales excluded), regardless of "
+                 "distance from any selected entry point.",
+        )
+        c6.metric(
+            "% of England & Scotland Covered",
+            f"{result['coverage_pct_england_scotland']:.2f}%",
+            help="Qualifying population as a share of the England & Scotland total above.",
+        )
 
     multi_df = result.get("multi_hub_df", pd.DataFrame())
     single_df = result.get("single_hub_df", pd.DataFrame())
@@ -558,6 +576,47 @@ with tab_cross:
         f"({outer_radius:.1f} catchment + {petal_radius:.1f} petal run)."
     )
 
+    airport_overrides = {}
+    with st.expander("Per-airport catchment overrides (optional)", expanded=True):
+        st.caption(
+            "Give an individual entry point a bigger or smaller catchment / petal run "
+            "radius than the settings above. Leave a cell blank to use the default. "
+            "Only the catchment radii are overridable — density and route-efficiency "
+            "filters stay global for every entry point."
+        )
+        if selected_names:
+            name_to_code = {a["name"]: a["code"] for a in airports}
+            override_editor_df = pd.DataFrame({
+                "Airport": selected_names,
+                "Radius Override": [None] * len(selected_names),
+                "Petal Radius Override": [None] * len(selected_names),
+            })
+            edited_overrides_df = st.data_editor(
+                override_editor_df,
+                column_config={
+                    "Airport": st.column_config.TextColumn("Entry point", disabled=True),
+                    "Radius Override": st.column_config.NumberColumn(
+                        f"Radius override ({cb_radius_unit})", min_value=0.1, step=1.0
+                    ),
+                    "Petal Radius Override": st.column_config.NumberColumn(
+                        f"Petal radius override ({cb_radius_unit})", min_value=0.1, step=0.5
+                    ),
+                },
+                hide_index=True,
+                width="stretch",
+                key="cb_airport_overrides_editor",
+            )
+            for _, row in edited_overrides_df.iterrows():
+                entry = {}
+                if pd.notna(row["Radius Override"]):
+                    entry["outer_radius"] = float(row["Radius Override"])
+                if pd.notna(row["Petal Radius Override"]):
+                    entry["circle_radius"] = float(row["Petal Radius Override"])
+                if entry:
+                    airport_overrides[name_to_code[row["Airport"]]] = entry
+        else:
+            st.caption("Select at least one entry point above to set overrides.")
+
     st.markdown("#### Density / Volume Filters")
 
     cb_d1, cb_d2 = st.columns(2)
@@ -673,6 +732,7 @@ with tab_cross:
                 min_cluster_postcodes=int(min_cluster_postcodes),
                 min_cluster_population=float(min_cluster_population),
                 extension_radius=float(extension_radius),
+                airport_overrides=airport_overrides,
                 create_map_output=True,
                 map_filename="Cross_Border_Map.html",
             )

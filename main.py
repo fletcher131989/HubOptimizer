@@ -1887,7 +1887,7 @@ def local_population_window(lats, lons, populations, query_idx, window_radius_km
     )
 
 
-def _empty_cross_border_result(airport):
+def _empty_cross_border_result(airport, outer_radius_display=0.0, circle_radius_display=0.0, is_overridden=False):
     return {
         "airport_code": airport["code"],
         "airport_name": airport["name"],
@@ -1905,6 +1905,9 @@ def _empty_cross_border_result(airport):
         "excluded_by_island": 0,
         "extended_postcodes": 0,
         "extended_population": 0.0,
+        "outer_radius": outer_radius_display,
+        "circle_radius": circle_radius_display,
+        "is_overridden": is_overridden,
     }
 
 
@@ -2023,6 +2026,7 @@ def evaluate_cross_border_airports(
     min_cluster_postcodes=1,
     min_cluster_population=0.0,
     extension_radius_km=0.0,
+    airport_overrides=None,
 ):
     """
     For each airport, find postcodes within `outer_radius_km` of it whose local
@@ -2034,6 +2038,14 @@ def evaluate_cross_border_airports(
     Density (and the optional per-postcode population/density caps) is
     expressed per unit of `circle_radius_display`'s squared unit, e.g. people
     per square mile when the UI is set to miles.
+
+    `airport_overrides`, if given, is a dict keyed by airport code whose
+    values may override `outer_radius_km` and/or `circle_radius_km` (plus
+    `circle_radius_display`, needed alongside a `circle_radius_km` override
+    to keep the density area calc correct) for that one airport -- e.g. to
+    give a single entry point a bigger or smaller catchment than the rest.
+    Density threshold, filters, clustering and extension settings stay
+    global; only the catchment radii are overridable, to keep this simple.
 
     If `extension_radius_km` is set (and `cluster_link_radius_km` is also
     set, since extension only makes sense in terms of a cluster), a cluster
@@ -2052,18 +2064,14 @@ def evaluate_cross_border_airports(
 
     Returns (airport_results, covered_postcodes, multi_df, single_df, total_eligible_population).
     """
-    area = circle_area(circle_radius_display)
-    if area <= 0:
+    default_area = circle_area(circle_radius_display)
+    if default_area <= 0:
         raise ValueError("Circle radius must be greater than zero.")
 
     use_miles = radius_unit.lower() in ("mile", "miles", "mi")
     dist_col = f"Distance to Airport ({radius_unit})"
     density_col = f"Local Density (per sq {'mi' if use_miles else 'km'})"
     map_cols = ["Postcode", "Lat", "Lon", "Population", density_col, "Airport", "Airport Code", dist_col]
-
-    extend_km = float(extension_radius_km) if (extension_radius_km and cluster_link_radius_km) else 0.0
-    candidate_radius_km = outer_radius_km + extend_km
-    search_radius_km = candidate_radius_km + circle_radius_km
 
     airport_results = []
     covered_postcodes = set()
@@ -2074,20 +2082,40 @@ def evaluate_cross_border_airports(
 
     for airport in airports:
         lat, lon = airport["lat"], airport["lon"]
+        override = (airport_overrides or {}).get(airport["code"], {})
+        airport_outer_radius_km = override.get("outer_radius_km", outer_radius_km)
+        airport_circle_radius_km = override.get("circle_radius_km", circle_radius_km)
+        airport_circle_radius_display = override.get("circle_radius_display", circle_radius_display)
+        airport_outer_radius_display = (
+            airport_outer_radius_km / KM_PER_MILE if use_miles else airport_outer_radius_km
+        )
+        empty_kwargs = dict(
+            outer_radius_display=airport_outer_radius_display,
+            circle_radius_display=airport_circle_radius_display,
+            is_overridden=bool(override),
+        )
+
+        area = circle_area(airport_circle_radius_display)
+        if area <= 0:
+            raise ValueError(f"Circle radius must be greater than zero ({airport['name']}).")
+
+        extend_km = float(extension_radius_km) if (extension_radius_km and cluster_link_radius_km) else 0.0
+        candidate_radius_km = airport_outer_radius_km + extend_km
+        search_radius_km = candidate_radius_km + airport_circle_radius_km
 
         nearby_df = filter_city(df, lat, lon, search_radius_km).reset_index(drop=True)
 
         if nearby_df.empty:
-            airport_results.append(_empty_cross_border_result(airport))
+            airport_results.append(_empty_cross_border_result(airport, **empty_kwargs))
             continue
 
         dist_to_airport_km = haversine_array(
             lat, lon, nearby_df["lat"].to_numpy(), nearby_df["lon"].to_numpy()
         )
-        eligible_idx = np.where(dist_to_airport_km <= outer_radius_km)[0]
+        eligible_idx = np.where(dist_to_airport_km <= airport_outer_radius_km)[0]
 
         if len(eligible_idx) == 0:
-            airport_results.append(_empty_cross_border_result(airport))
+            airport_results.append(_empty_cross_border_result(airport, **empty_kwargs))
             continue
 
         candidate_idx = (
@@ -2106,7 +2134,7 @@ def evaluate_cross_border_airports(
             nearby_df["lon"].to_numpy(dtype=np.float64),
             populations,
             candidate_idx,
-            circle_radius_km,
+            airport_circle_radius_km,
         )
         local_density = local_population / area
 
@@ -2129,7 +2157,7 @@ def evaluate_cross_border_airports(
 
         excluded_by_island = 0
         if cluster_link_radius_km and cluster_link_radius_km > 0 and len(qualifying_idx) > 0:
-            core_mask = dist_to_airport_km[qualifying_idx] <= outer_radius_km
+            core_mask = dist_to_airport_km[qualifying_idx] <= airport_outer_radius_km
             keep_mask = island_filter_mask(
                 nearby_df["lat"].to_numpy(dtype=np.float64)[qualifying_idx],
                 nearby_df["lon"].to_numpy(dtype=np.float64)[qualifying_idx],
@@ -2147,7 +2175,7 @@ def evaluate_cross_border_airports(
                 qualifies[qualifying_positions[~keep_mask]] = False
                 qualifying_idx = candidate_idx[qualifies]
 
-        extended_mask = dist_to_airport_km[qualifying_idx] > outer_radius_km
+        extended_mask = dist_to_airport_km[qualifying_idx] > airport_outer_radius_km
         extended_postcodes = int(extended_mask.sum())
         extended_population = float(populations[qualifying_idx][extended_mask].sum())
 
@@ -2202,6 +2230,9 @@ def evaluate_cross_border_airports(
             "excluded_by_island": excluded_by_island,
             "extended_postcodes": extended_postcodes,
             "extended_population": extended_population,
+            "outer_radius": airport_outer_radius_display,
+            "circle_radius": airport_circle_radius_display,
+            "is_overridden": bool(override),
         })
 
     multi_df = (
@@ -2263,6 +2294,7 @@ def create_cross_border_map(
     covered_df,
     output_file="Cross_Border_Map.html",
     extension_radius_km=0.0,
+    airport_overrides=None,
 ):
     if not airports:
         raise ValueError("At least one airport must be selected.")
@@ -2273,12 +2305,18 @@ def create_cross_border_map(
     m = folium.Map(location=[centre_lat, centre_lon], zoom_start=7, control_scale=True)
 
     use_miles = unit.lower() in ("mile", "miles", "mi")
-    outer_radius_display = outer_radius_km / KM_PER_MILE if use_miles else outer_radius_km
-    max_reach_km = outer_radius_km + extension_radius_km
-    max_reach_display = max_reach_km / KM_PER_MILE if use_miles else max_reach_km
 
     for i, airport in enumerate(airports):
         color = HUB_COLORS[i % len(HUB_COLORS)]
+        override = (airport_overrides or {}).get(airport["code"], {})
+        airport_outer_radius_km = override.get("outer_radius_km", outer_radius_km)
+        airport_outer_radius_display = (
+            airport_outer_radius_km / KM_PER_MILE if use_miles else airport_outer_radius_km
+        )
+        airport_max_reach_km = airport_outer_radius_km + extension_radius_km
+        airport_max_reach_display = (
+            airport_max_reach_km / KM_PER_MILE if use_miles else airport_max_reach_km
+        )
 
         folium.Marker(
             [airport["lat"], airport["lon"]],
@@ -2289,24 +2327,24 @@ def create_cross_border_map(
 
         folium.Circle(
             [airport["lat"], airport["lon"]],
-            radius=outer_radius_km * 1000,
+            radius=airport_outer_radius_km * 1000,
             color=color,
             fill=False,
             weight=2,
-            popup=f"{airport['name']} catchment radius: {outer_radius_display:.1f} {unit}",
+            popup=f"{airport['name']} catchment radius: {airport_outer_radius_display:.1f} {unit}",
         ).add_to(m)
 
         if extension_radius_km > 0:
             folium.Circle(
                 [airport["lat"], airport["lon"]],
-                radius=max_reach_km * 1000,
+                radius=airport_max_reach_km * 1000,
                 color=color,
                 fill=False,
                 weight=1,
                 dash_array="6, 6",
                 popup=(
                     f"{airport['name']} max reach with cluster extension: "
-                    f"{max_reach_display:.1f} {unit}"
+                    f"{airport_max_reach_display:.1f} {unit}"
                 ),
             ).add_to(m)
 
@@ -2322,6 +2360,21 @@ def create_cross_border_map(
     print(f"\nCross-border map saved to {output_file}")
 
 
+# Postcode area (1-2 letter prefix) codes for Northern Ireland and Wales, used
+# to approximate an England+Scotland population total. This is area-level, not
+# an exact geographic split -- a handful of areas straddle the England/Wales
+# border -- but it's the standard granularity postcode-prefix reporting works at.
+NORTHERN_IRELAND_POSTCODE_AREAS = {"BT"}
+WALES_POSTCODE_AREAS = {"CF", "LD", "LL", "NP", "SA", "SY"}
+
+
+def total_population_england_scotland(df):
+    """Total population of postcodes whose area isn't Northern Ireland or Wales."""
+    area = df["postcode"].str.extract(r"^([A-Z]{1,2})", expand=False)
+    excluded = NORTHERN_IRELAND_POSTCODE_AREAS | WALES_POSTCODE_AREAS
+    return float(df.loc[~area.isin(excluded), "population"].sum())
+
+
 def run_cross_border_optimisation(
     airport_codes,
     outer_radius,
@@ -2334,6 +2387,7 @@ def run_cross_border_optimisation(
     min_cluster_postcodes=1,
     min_cluster_population=0.0,
     extension_radius=0.0,
+    airport_overrides=None,
     create_map_output=True,
     map_filename="Cross_Border_Map.html",
 ):
@@ -2348,6 +2402,17 @@ def run_cross_border_optimisation(
         convert_to_km(cluster_link_radius, radius_unit) if cluster_link_radius else None
     )
     extension_radius_km = convert_to_km(extension_radius, radius_unit) if extension_radius else 0.0
+
+    airport_overrides_km = {}
+    for code, ov in (airport_overrides or {}).items():
+        entry = {}
+        if ov.get("outer_radius") is not None:
+            entry["outer_radius_km"] = convert_to_km(ov["outer_radius"], radius_unit)
+        if ov.get("circle_radius") is not None:
+            entry["circle_radius_km"] = convert_to_km(ov["circle_radius"], radius_unit)
+            entry["circle_radius_display"] = ov["circle_radius"]
+        if entry:
+            airport_overrides_km[code] = entry
 
     df = load_postcode_data()
 
@@ -2366,6 +2431,7 @@ def run_cross_border_optimisation(
             min_cluster_postcodes=min_cluster_postcodes,
             min_cluster_population=min_cluster_population,
             extension_radius_km=extension_radius_km,
+            airport_overrides=airport_overrides_km,
         )
     )
 
@@ -2373,6 +2439,12 @@ def run_cross_border_optimisation(
     coverage_pct = (
         0.0 if total_eligible_population == 0
         else 100.0 * covered_population / total_eligible_population
+    )
+
+    england_scotland_population = total_population_england_scotland(df)
+    coverage_pct_england_scotland = (
+        0.0 if england_scotland_population == 0
+        else 100.0 * covered_population / england_scotland_population
     )
 
     if create_map_output:
@@ -2390,6 +2462,7 @@ def run_cross_border_optimisation(
             covered_df=covered_map_df,
             output_file=map_filename,
             extension_radius_km=extension_radius_km,
+            airport_overrides=airport_overrides_km,
         )
 
     return {
@@ -2405,9 +2478,12 @@ def run_cross_border_optimisation(
         "min_cluster_postcodes": min_cluster_postcodes,
         "min_cluster_population": min_cluster_population,
         "extension_radius": extension_radius,
+        "airport_overrides": airport_overrides,
         "total_population": total_eligible_population,
         "covered_population": covered_population,
         "coverage_pct": coverage_pct,
+        "england_scotland_population": england_scotland_population,
+        "coverage_pct_england_scotland": coverage_pct_england_scotland,
         "covered_postcodes": covered_postcodes,
         "multi_hub_df": multi_df,
         "single_hub_df": single_df,
