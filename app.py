@@ -537,9 +537,11 @@ with tab_cross:
     # and never alongside a `default=` on the same widget. Doing both (as this
     # code used to) is a documented Streamlit anti-pattern that desyncs the
     # frontend/backend state and makes every add/remove need two clicks.
+    default_excluded_codes = {"BFS", "EDI"}  # Belfast International, Edinburgh
     if "cb_selected_options" not in st.session_state:
         st.session_state["cb_selected_options"] = [
-            option_by_name[a["name"]] for a in airports if a["freight_importance"] in quick_filter
+            option_by_name[a["name"]] for a in airports
+            if a["freight_importance"] in quick_filter and a["code"] not in default_excluded_codes
         ]
 
     if st.button("Apply freight filter to selection"):
