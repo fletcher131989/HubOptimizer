@@ -14,6 +14,9 @@ from main import (
     run_hub_optimisation_polygon_by_coverage,
     run_cross_border_optimisation,
     load_uk_airports,
+    add_milk_rounds_to_result,
+    convert_to_km,
+    KM_PER_MILE,
 )
 
 
@@ -119,6 +122,7 @@ def build_results_df(hubs):
         overlap_pct = (100.0 * overlap / pot_pop) if pot_pop > 0 else 0.0
         rows.append({
             "Hub":            h.get("hub_name", f"Hub {h['hub_number']}"),
+            "Role":           "Mothership" if h.get("is_mothership") else "Hub",
             "Postcode":       h.get("hub_postcode", ""),
             "Latitude":       round(h["lat"], 5),
             "Longitude":      round(h["lon"], 5),
@@ -153,6 +157,9 @@ def render_results(result, map_filename="user_polygon_result.html"):
         c3.metric("Coverage",                f"{result['coverage_pct']:.1f}%")
         c4.metric("Hubs Placed",             str(n_hubs))
 
+    for note in result.get("notes", []):
+        st.info(note)
+
     # ← NEW: top-level download buttons
     multi_df  = result.get("multi_hub_df",  pd.DataFrame())
     single_df = result.get("single_hub_df", pd.DataFrame())
@@ -162,6 +169,11 @@ def render_results(result, map_filename="user_polygon_result.html"):
 
     st.markdown("#### Hub Summary")
     st.dataframe(build_results_df(result["hubs"]), width='stretch', hide_index=True)
+
+    if result.get("milk_rounds_error"):
+        st.warning(f"Milk rounds not planned: {result['milk_rounds_error']}")
+    if result.get("milk_rounds"):
+        render_milk_rounds(result["milk_rounds"])
 
     st.markdown("#### Top Area Types per Hub")
     for h in result["hubs"]:
@@ -193,10 +205,75 @@ def render_results(result, map_filename="user_polygon_result.html"):
 
     st.caption("Map output saved to `user_polygon_result.html`.")
     st.markdown("#### Coverage Map")
+    if result.get("coverage_mode", "straight") != "straight":
+        st.caption(
+            f"Coverage measured along the road network ({result.get('coverage_label', '')}). "
+            "Shaded squares show where each hub's covered postcodes are."
+        )
     if Path(map_filename).exists():
         st.iframe(map_filename, height=550)
     else:
         st.warning("Map file not found — it may not have been generated.")
+
+
+def render_milk_rounds(mr):
+    st.markdown("#### Milk Rounds")
+    s = mr["settings"]
+    unit = s["distance_unit"]
+    speed_display = s["avg_speed_kmh"] / KM_PER_MILE if unit == "miles" else s["avg_speed_kmh"]
+    speed_unit = "mph" if unit == "miles" else "km/h"
+    mode_txt = (
+        f"up to {s['num_rounds']} round(s)" if s["num_rounds"]
+        else "auto (fewest rounds that hit the window)"
+    )
+    if s.get("travel_source") == "road network":
+        travel_txt = (
+            f"travel: fastest **road-network** routes at speed limits × "
+            f"{s.get('speed_factor', 0.6):.2f}"
+        )
+    else:
+        travel_txt = (
+            f"**estimated** travel: straight line × {s['road_factor']:.2f} at "
+            f"{speed_display:.0f} {speed_unit}"
+        )
+    st.caption(
+        f"Mode: {mode_txt} · window {s['time_window_min']:.0f} min to reach each hub · "
+        f"{s['unload_min']:.0f} min unload per hub · {travel_txt}. Return leg is shown "
+        f"but not counted against the window."
+    )
+    if s.get("unreachable_pairs"):
+        st.warning(
+            f"{s['unreachable_pairs']} hub-to-hub leg(s) had no road route (a hub may sit on a "
+            "disconnected part of the network) and were estimated instead."
+        )
+
+    if not mr["rounds"]:
+        st.info("No non-mothership hubs to deliver to.")
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rounds Used", str(mr["rounds_used"]))
+    m2.metric("Outbound Drive Time", f"{mr['total_drive_min'] / 60:.1f} h")
+    m3.metric(f"Outbound Distance ({unit})", f"{mr['total_drive_distance']:,.1f}")
+    m4.metric("Hubs Arriving Late", str(mr["late_stops"]))
+    if mr["late_stops"]:
+        st.warning(
+            f"{mr['late_stops']} hub(s) can't be reached within the "
+            f"{s['time_window_min']:.0f}-minute window with these settings — "
+            + ("try more milk rounds, or " if s["num_rounds"] else "")
+            + "check the speed/window settings (some hubs may be too far from any mothership)."
+        )
+
+    st.dataframe(mr["rounds_df"], width="stretch", hide_index=True)
+    with st.expander("Stop-by-stop schedule"):
+        st.dataframe(mr["stops_df"], width="stretch", hide_index=True)
+    st.download_button(
+        label="⬇️ Download milk round schedule",
+        data=mr["stops_df"].to_csv(index=False),
+        file_name="milk_rounds.csv",
+        mime="text/csv",
+        key="milk_rounds_csv",
+    )
 
 
 def build_cross_border_results_df(airport_results):
@@ -320,8 +397,47 @@ with tab_hub:
             help="Safety limit — optimization stops here even if the target coverage has not been reached.",
         )
 
-    hub_radius = st.sidebar.number_input("Hub radius", min_value=0.1, value=5.0)
+    coverage_mode_label = st.sidebar.selectbox(
+        "Coverage measured by",
+        ["Straight line", "Road distance", "Drive time"],
+        index=0,
+        help="Straight line: a simple radius around each hub (ignores rivers etc.).\n\n"
+             "Road distance / Drive time: measured along the OpenStreetMap road network, "
+             "so e.g. the Thames can only be crossed at bridges and tunnels. The first run "
+             "in a new area downloads the road network (can take several minutes); it's "
+             "cached for later runs.",
+        key="coverage_mode",
+    )
+    coverage_mode = {
+        "Straight line": "straight", "Road distance": "road_distance", "Drive time": "drive_time",
+    }[coverage_mode_label]
+
+    max_drive_time = None
+    speed_factor = None
+    if coverage_mode == "drive_time":
+        hub_radius = 5.0  # unused for drive-time coverage
+        max_drive_time = st.sidebar.number_input(
+            "Max drive time from hub (min)", min_value=1.0, max_value=240.0, value=15.0, step=1.0,
+            key="max_drive_time",
+        )
+    else:
+        hub_radius = st.sidebar.number_input(
+            "Hub radius" + (" (along roads)" if coverage_mode == "road_distance" else ""),
+            min_value=0.1, value=5.0,
+        )
     radius_unit = st.sidebar.selectbox("Radius unit", ["miles", "km"], index=0)
+
+    def traffic_speed_factor_input():
+        return st.sidebar.number_input(
+            "Traffic speed factor",
+            min_value=0.1, max_value=1.5, value=0.6, step=0.05,
+            help="Drive times use OpenStreetMap speed limits multiplied by this factor. "
+                 "~0.5–0.6 is realistic for urban London traffic; ~0.8–0.9 for regional roads.",
+            key="road_speed_factor",
+        )
+
+    if coverage_mode == "drive_time":
+        speed_factor = traffic_speed_factor_input()
     grid_spacing_km = st.sidebar.number_input(
         "Grid spacing (km)",
         min_value=0.25,
@@ -336,6 +452,7 @@ with tab_hub:
     # --------------------------------------------------
 
     fixed_hubs_input = []
+    mothership_flags = []
 
     if opt_mode == "Number of hubs":
         st.sidebar.markdown("---")
@@ -356,7 +473,14 @@ with tab_hub:
             col_a, col_b = st.sidebar.columns(2)
             lat = col_a.number_input("Lat", key=f"fh_lat_{i}", value=52.4800, format="%.5f", step=0.001)
             lon = col_b.number_input("Lon", key=f"fh_lon_{i}", value=-1.8900, format="%.5f", step=0.001)
+            is_ms = st.sidebar.checkbox(
+                "Mothership",
+                key=f"fh_ms_{i}",
+                help="A mothership supplies the other hubs via milk rounds. It still "
+                     "covers the population around it like any other hub.",
+            )
             fixed_hubs_input.append((name.strip(), float(lat), float(lon)))
+            mothership_flags.append(bool(is_ms))
 
         if num_fixed > 0:
             num_free = int(num_hubs) - num_fixed
@@ -364,6 +488,76 @@ with tab_hub:
                 st.sidebar.caption(f"↳ {num_free} hub(s) will be optimized automatically.")
             else:
                 st.sidebar.caption("↳ All hubs are fixed — no optimization will run.")
+
+    mothership_hub_numbers = [i + 1 for i, flag in enumerate(mothership_flags) if flag]
+    milk_round_kwargs = None
+
+    if mothership_hub_numbers:
+        st.sidebar.markdown("---")
+        st.sidebar.header("Milk Rounds")
+        st.sidebar.caption(
+            "Routes from the mothership(s) to every other hub. Travel times are "
+            "estimated for now (straight line × road factor at an average speed)."
+        )
+        num_rounds = st.sidebar.number_input(
+            "Number of milk rounds (0 = auto)",
+            min_value=0,
+            max_value=50,
+            value=0,
+            help="Maximum number of rounds (routes) available, shared across all motherships. "
+                 "0 = use the fewest rounds that reach every hub within the time window.",
+            key="mr_num_rounds",
+        )
+        mr_c1, mr_c2 = st.sidebar.columns(2)
+        time_window = mr_c1.number_input(
+            "Window (min)", min_value=5, max_value=1440, value=120, step=15,
+            help="Every hub should be reached within this many minutes of leaving the mothership "
+                 "(including unloading at earlier hubs on the round).",
+            key="mr_time_window",
+        )
+        unload_time = mr_c2.number_input(
+            "Unload (min)", min_value=0, max_value=240, value=15, step=5,
+            help="Time spent unloading at each hub.",
+            key="mr_unload",
+        )
+        travel_source = st.sidebar.radio(
+            "Travel times from",
+            ["Road network", "Estimate"],
+            index=0,
+            horizontal=True,
+            help="Road network: fastest routes along OpenStreetMap roads (respects the "
+                 "Thames etc.), drawn on the map. Estimate: straight line × road factor at "
+                 "an average speed.",
+            key="mr_travel_source",
+        )
+        speed_unit = "mph" if radius_unit == "miles" else "km/h"
+        avg_speed = 20.0 if radius_unit == "miles" else 32.0
+        road_factor = 1.3
+        if travel_source == "Estimate":
+            mr_c3, mr_c4 = st.sidebar.columns(2)
+            avg_speed = mr_c3.number_input(
+                f"Avg speed ({speed_unit})", min_value=1.0, max_value=80.0,
+                value=avg_speed, step=1.0,
+                help="Average driving speed used to estimate travel time. ~15–20 mph is typical "
+                     "for urban London; higher for regional/motorway routes.",
+                key="mr_speed",
+            )
+            road_factor = mr_c4.number_input(
+                "Road factor", min_value=1.0, max_value=3.0, value=1.3, step=0.05,
+                help="Road distance ÷ straight-line distance. 1.3 is a common UK average.",
+                key="mr_road_factor",
+            )
+        elif speed_factor is None:
+            speed_factor = traffic_speed_factor_input()
+        milk_round_kwargs = dict(
+            num_rounds=int(num_rounds) or None,
+            time_window_min=float(time_window),
+            unload_min=float(unload_time),
+            avg_speed_kmh=convert_to_km(float(avg_speed), radius_unit),
+            road_factor=float(road_factor),
+            use_road_network=travel_source == "Road network",
+            speed_factor=float(speed_factor) if speed_factor else 0.6,
+        )
 
     # --------------------------------------------------
     # Map
@@ -427,24 +621,32 @@ with tab_hub:
 
             if st.button(run_label, type="primary"):
                 overlay = st.empty()
+                uses_road = coverage_mode != "straight" or (
+                    milk_round_kwargs is not None and milk_round_kwargs["use_road_network"]
+                )
+                road_note = (
+                    " Road network: the first run in a new area downloads OpenStreetMap "
+                    "roads, which can take several minutes."
+                    if uses_road else ""
+                )
 
                 if opt_mode == "Target coverage %":
                     show_overlay(
                         overlay,
                         message=f"Finding hubs for {target_coverage}% coverage…",
-                        subtext=f"Adding hubs until {target_coverage}% of the population is covered (max {int(max_hubs)}).",
+                        subtext=f"Adding hubs until {target_coverage}% of the population is covered (max {int(max_hubs)})." + road_note,
                     )
                 elif fixed_hubs_input and num_free == 0:
                     show_overlay(
                         overlay,
                         message="Computing coverage…",
-                        subtext=f"Evaluating {len(fixed_hubs_input)} fixed hub(s) across {n_pts} boundary points.",
+                        subtext=f"Evaluating {len(fixed_hubs_input)} fixed hub(s) across {n_pts} boundary points." + road_note,
                     )
                 else:
                     show_overlay(
                         overlay,
                         message="Optimizing…",
-                        subtext=f"Placing {int(num_hubs)} hub(s) across {n_pts} boundary points.",
+                        subtext=f"Placing {int(num_hubs)} hub(s) across {n_pts} boundary points." + road_note,
                     )
 
                 try:
@@ -458,6 +660,9 @@ with tab_hub:
                             grid_spacing_km=float(grid_spacing_km),
                             create_map_output=True,
                             map_filename="user_polygon_result.html",
+                            coverage_mode=coverage_mode,
+                            max_drive_time_min=max_drive_time,
+                            speed_factor=float(speed_factor) if speed_factor else 0.6,
                         )
                     elif fixed_hubs_input and num_free > 0:
                         result = run_hybrid_optimisation_polygon(
@@ -468,6 +673,9 @@ with tab_hub:
                             radius_unit=radius_unit,
                             grid_spacing_km=float(grid_spacing_km),
                             map_filename="user_polygon_result.html",
+                            coverage_mode=coverage_mode,
+                            max_drive_time_min=max_drive_time,
+                            speed_factor=float(speed_factor) if speed_factor else 0.6,
                         )
                     elif fixed_hubs_input and num_free == 0:
                         result = run_fixed_hub_coverage_polygon(
@@ -477,6 +685,9 @@ with tab_hub:
                             radius_unit=radius_unit,
                             create_map_output=True,
                             map_filename="user_polygon_result.html",
+                            coverage_mode=coverage_mode,
+                            max_drive_time_min=max_drive_time,
+                            speed_factor=float(speed_factor) if speed_factor else 0.6,
                         )
                     else:
                         result = run_hub_optimisation_polygon(
@@ -488,7 +699,23 @@ with tab_hub:
                             grid_spacing_km=float(grid_spacing_km),
                             create_map_output=True,
                             map_filename="user_polygon_result.html",
+                            coverage_mode=coverage_mode,
+                            max_drive_time_min=max_drive_time,
+                            speed_factor=float(speed_factor) if speed_factor else 0.6,
                         )
+
+                    if milk_round_kwargs and fixed_hubs_input:
+                        try:
+                            add_milk_rounds_to_result(
+                                result,
+                                mothership_hub_numbers,
+                                hub_radius_km=convert_to_km(hub_radius, radius_unit),
+                                map_filename="user_polygon_result.html",
+                                **milk_round_kwargs,
+                            )
+                        except Exception as mr_err:
+                            result["milk_rounds_error"] = str(mr_err)
+
                     overlay.empty()
                     st.session_state["result"] = result
                     st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1

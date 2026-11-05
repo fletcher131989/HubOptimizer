@@ -6,3 +6,6 @@ streamlit==1.56.0
 streamlit-folium==0.27.1
 pg8000==1.31.2
 python-dotenv==1.1.0
+ortools==9.15.6755
+osmnx==2.1.1
+scipy==1.18.1

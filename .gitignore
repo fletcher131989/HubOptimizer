@@ -7,3 +7,8 @@ postcode_data/
 __pycache__/
 .venv/
 .env
+# OpenStreetMap road-network cache (downloaded on demand)
+road_cache/
+
+# Raw OpenStreetMap extracts used by build_road_tiles.py (large, re-downloadable)
+osm_source/

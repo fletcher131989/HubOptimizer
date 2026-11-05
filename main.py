@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 from math import radians, sin, cos, sqrt, atan2
@@ -272,7 +273,12 @@ def build_postcode_parquet_data(chunk_size=250_000):
 
 
 #@st.cache_data(show_spinner=False)
-def load_postcode_data():
+def load_postcode_data(bbox=None):
+    """
+    Load postcode rows from postcode_parquet/. If `bbox` = (south, west,
+    north, east) is given, only rows inside it are read (filter pushed down to
+    the parquet reader), which keeps memory far below loading the whole UK.
+    """
     parquet_folder = Path("postcode_parquet")
     files = sorted(parquet_folder.glob("*.parquet"))
 
@@ -282,8 +288,13 @@ def load_postcode_data():
             "Run build_postcode_parquet_data() locally first."
         )
 
+    filters = None
+    if bbox is not None:
+        s, w, n, e = (float(x) for x in bbox)
+        filters = [("lat", ">=", s), ("lat", "<=", n), ("lon", ">=", w), ("lon", "<=", e)]
+
     df = pd.concat(
-        [pd.read_parquet(f, columns=_PARQUET_COLS) for f in files],
+        [pd.read_parquet(f, columns=_PARQUET_COLS, filters=filters) for f in files],
         ignore_index=True,
     )
 
@@ -553,7 +564,86 @@ def validate_fixed_hubs(hubs):
 # Fixed-hub coverage calculation
 # --------------------------------------------------
 
-def evaluate_fixed_hubs(df, hubs, hub_radius_km):
+COVERAGE_MODES = {
+    "straight": "Straight line",
+    "road_distance": "Road distance",
+    "drive_time": "Drive time",
+}
+
+
+def build_road_coverage(
+    area_df,
+    coverage_mode,
+    hub_radius_km,
+    max_drive_time_min=None,
+    speed_factor=0.6,
+    extra_points=None,
+):
+    """
+    Build a RoadCoverage for `area_df` (row order preserved), or return None
+    for straight-line mode. The road graph covers the area plus any
+    `extra_points` [(lat, lon), ...] (e.g. fixed hubs placed outside it).
+
+    road_distance: a hub covers postcodes within hub_radius_km along roads.
+    drive_time:    a hub covers postcodes within max_drive_time_min of driving,
+                   at OSM speed limits x speed_factor (traffic allowance).
+    """
+    if coverage_mode in (None, "straight"):
+        return None
+    if coverage_mode not in COVERAGE_MODES:
+        raise ValueError(f"Unknown coverage mode: {coverage_mode!r}")
+
+    from road_network import RoadCoverage, load_road_graph_for_points
+
+    lats = area_df["lat"].to_numpy(dtype=np.float64)
+    lons = area_df["lon"].to_numpy(dtype=np.float64)
+    if extra_points:
+        lats = np.concatenate([lats, [p[0] for p in extra_points]])
+        lons = np.concatenate([lons, [p[1] for p in extra_points]])
+    graph = load_road_graph_for_points(
+        [lats.min(), lats.max()], [lons.min(), lons.max()], buffer_km=3.0
+    )
+    if graph.missing_tiles:
+        from road_network import tile_of
+
+        ti, tj = tile_of(area_df["lat"].to_numpy(), area_df["lon"].to_numpy())
+        in_missing = np.fromiter(
+            ((a, b) in graph.missing_tiles for a, b in zip(ti.tolist(), tj.tolist())),
+            dtype=bool, count=len(ti),
+        )
+        if in_missing.any():
+            _RUN_NOTES.append(
+                f"{int(in_missing.sum()):,} postcodes are outside the pre-built road network "
+                "(England, Scotland and Wales only, e.g. Northern Ireland is not included) "
+                "and can't be reached by road in this run."
+            )
+
+    if coverage_mode == "road_distance":
+        metric, limit = "distance", hub_radius_km * 1000.0
+    else:
+        if not max_drive_time_min or max_drive_time_min <= 0:
+            raise ValueError("Max drive time must be greater than zero.")
+        metric, limit = "time", float(max_drive_time_min) * 60.0
+
+    return RoadCoverage(
+        graph,
+        area_df["lat"].to_numpy(dtype=np.float64),
+        area_df["lon"].to_numpy(dtype=np.float64),
+        limit=limit,
+        metric=metric,
+        speed_factor=speed_factor,
+    )
+
+
+def coverage_description(coverage_mode, hub_radius, radius_unit, max_drive_time_min=None, speed_factor=None):
+    if coverage_mode == "drive_time":
+        return f"{max_drive_time_min:g} min drive (traffic factor {speed_factor:g})"
+    if coverage_mode == "road_distance":
+        return f"{hub_radius:g} {radius_unit} by road"
+    return f"{hub_radius:g} {radius_unit} straight line"
+
+
+def evaluate_fixed_hubs(df, hubs, hub_radius_km, coverage=None):
     if df.empty:
         raise ValueError("No postcode rows found in the selected area.")
 
@@ -562,17 +652,24 @@ def evaluate_fixed_hubs(df, hubs, hub_radius_km):
     demand_df = df.reset_index(drop=True)
     populations = demand_df["population"].to_numpy(dtype=np.float32)
     households = demand_df["households"].to_numpy(dtype=np.float32)
-    demand_coords_rad = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
 
-    tree = BallTree(demand_coords_rad, metric="haversine")
-    radius_rad = hub_radius_km / EARTH_RADIUS_KM
+    if coverage is None:
+        demand_coords_rad = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
+        tree = BallTree(demand_coords_rad, metric="haversine")
+        radius_rad = hub_radius_km / EARTH_RADIUS_KM
+        hub_cover = [
+            tree.query_radius(np.radians([[lat, lon]]), r=radius_rad)[0] for _, lat, lon in hubs
+        ]
+    else:
+        if len(coverage) != len(demand_df):
+            raise ValueError("Road coverage is out of sync with the demand data.")
+        hub_cover = coverage.reach([h[1] for h in hubs], [h[2] for h in hubs])
 
     covered_mask = np.zeros(len(demand_df), dtype=bool)
     hub_results = []
 
     for hub_num, (hub_name, hub_lat, hub_lon) in enumerate(hubs, start=1):
-        hub_coord_rad = np.radians([[hub_lat, hub_lon]])
-        full_cover_idx = tree.query_radius(hub_coord_rad, r=radius_rad)[0]
+        full_cover_idx = hub_cover[hub_num - 1]
 
         new_cover_idx = full_cover_idx[~covered_mask[full_cover_idx]]
 
@@ -624,6 +721,50 @@ def evaluate_fixed_hubs(df, hubs, hub_radius_km):
 # Unified map output
 # --------------------------------------------------
 
+# Approximate hex equivalents of folium.Icon marker colours, for fills.
+_FOLIUM_HEX = {
+    "red": "#d63e2a", "blue": "#38aadd", "green": "#72b026", "purple": "#d252b9",
+    "orange": "#f69730", "darkred": "#a23336", "cadetblue": "#436978",
+    "darkgreen": "#728224", "darkpurple": "#5b396b", "lightred": "#ff8e7f",
+    "beige": "#ffcb92", "darkblue": "#0067a3", "lightblue": "#88daff",
+    "lightgreen": "#bbf970", "gray": "#575757", "black": "#303030",
+}
+COVERAGE_CELL_KM = 0.3
+
+
+def _add_coverage_cells(m, hub_cov_df, color, label, cell_km=COVERAGE_CELL_KM):
+    """Shade the ~cell_km grid squares containing a hub's covered postcodes."""
+    if hub_cov_df is None or hub_cov_df.empty:
+        return
+    lats = hub_cov_df["Lat"].to_numpy(dtype=np.float64)
+    lons = hub_cov_df["Lon"].to_numpy(dtype=np.float64)
+    dlat = cell_km / 110.574
+    dlon = cell_km / (111.320 * np.cos(np.radians(float(lats.mean()))))
+    cells = np.unique(
+        np.column_stack([np.floor(lats / dlat), np.floor(lons / dlon)]).astype(np.int64), axis=0
+    )
+    features = []
+    for ci, cj in cells:
+        s, w = ci * dlat, cj * dlon
+        n, e = s + dlat, w + dlon
+        features.append({
+            "type": "Feature",
+            "properties": {},
+            "geometry": {"type": "Polygon", "coordinates": [[
+                [round(w, 5), round(s, 5)], [round(e, 5), round(s, 5)],
+                [round(e, 5), round(n, 5)], [round(w, 5), round(n, 5)],
+                [round(w, 5), round(s, 5)],
+            ]]},
+        })
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        style_function=lambda _f, c=color: {
+            "fillColor": c, "color": c, "weight": 0, "fillOpacity": 0.28,
+        },
+        tooltip=label,
+    ).add_to(m)
+
+
 def create_hub_map(
     hub_radius_km,
     hubs,
@@ -633,12 +774,26 @@ def create_hub_map(
     centre_lat=None,
     centre_lon=None,
     city_radius_km=None,
+    milk_rounds=None,
+    coverage_df=None,
+    coverage_label=None,
 ):
     """Create an interactive Folium map showing hub placements.
+
+    If `coverage_df` (a multi_hub_df: Postcode/Lat/Lon/Hub Number rows) is
+    given, each hub's reach is drawn as shaded grid cells over the postcodes
+    it actually covers, instead of a radius circle -- used for road-network
+    coverage, where a circle would be misleading (e.g. it would ignore the
+    Thames).
 
     Supports both polygon-boundary and city-circle modes:
       - Polygon mode: pass boundary_points (centre is derived automatically).
       - Circle mode:  pass centre_lat, centre_lon, and city_radius_km.
+
+    If `milk_rounds` (from plan_milk_rounds) is given, each round is drawn as
+    a coloured line from its mothership through its stops in order, with a
+    dashed line for the return leg. Hubs flagged `is_mothership` get a
+    distinct star marker.
     """
     if boundary_points is not None:
         polygon = validate_boundary_points(boundary_points)
@@ -698,21 +853,60 @@ def create_hub_map(
         if "overlap_population" in hub:
             popup_parts.append(f"Overlap population: {int(hub['overlap_population']):,}")
 
+        is_mothership = bool(hub.get("is_mothership"))
+        if is_mothership:
+            popup_parts.insert(1, "<i>Mothership</i>")
+
         folium.Marker(
             [float(hub["lat"]), float(hub["lon"])],
             popup="<br>".join(popup_parts),
-            tooltip=hub_label,
-            icon=folium.Icon(color=color),
+            tooltip=f"{hub_label} (Mothership)" if is_mothership else hub_label,
+            icon=(
+                folium.Icon(color="black", icon="star")
+                if is_mothership else folium.Icon(color=color)
+            ),
         ).add_to(m)
 
-        folium.Circle(
-            [float(hub["lat"]), float(hub["lon"])],
-            radius=hub_radius_km * 1000,
-            color=color,
-            fill=True,
-            fill_opacity=0.18,
-            popup=f"{hub_label} radius: {hub_radius_display:.1f} {unit}",
-        ).add_to(m)
+        if coverage_df is None:
+            folium.Circle(
+                [float(hub["lat"]), float(hub["lon"])],
+                radius=hub_radius_km * 1000,
+                color=color,
+                fill=True,
+                fill_opacity=0.18,
+                popup=f"{hub_label} radius: {hub_radius_display:.1f} {unit}",
+            ).add_to(m)
+        else:
+            _add_coverage_cells(
+                m, coverage_df[coverage_df["Hub Number"] == hub["hub_number"]],
+                color=_FOLIUM_HEX.get(color, "#3388ff"),
+                label=f"{hub_label} reach: {coverage_label or 'road network'}",
+            )
+
+    if milk_rounds and milk_rounds.get("rounds"):
+        dist_unit = milk_rounds["settings"]["distance_unit"]
+        for r in milk_rounds["rounds"]:
+            label = (
+                f"Round {r['round_number']} from {r['mothership']}: "
+                f"{len(r['stops'])} stop(s), last arrival {_fmt_hmm(r['last_arrival_min'])}, "
+                f"{r['outbound_distance']:.1f} {dist_unit} outbound"
+            )
+            folium.PolyLine(
+                r["path"], color=r["color"], weight=4, opacity=0.85, tooltip=label,
+            ).add_to(m)
+            folium.PolyLine(
+                r.get("return_path") or [r["path"][-1], r["path"][0]], color=r["color"], weight=2,
+                opacity=0.6, dash_array="6 8", tooltip=f"Round {r['round_number']} return",
+            ).add_to(m)
+            for s in r["stops"]:
+                folium.CircleMarker(
+                    [s["lat"], s["lon"]], radius=9, color=r["color"], fill=True,
+                    fill_color="white", fill_opacity=0.9, weight=3,
+                    tooltip=(
+                        f"Round {r['round_number']} stop {s['sequence']}: {s['hub']} "
+                        f"(arrive {_fmt_hmm(s['arrival_min'])})"
+                    ),
+                ).add_to(m)
 
     m.save(output_file)
     print(f"\nMap saved to {output_file}")
@@ -757,6 +951,81 @@ def print_hub_results(hubs, covered_population, total_population, coverage_pct, 
     print(f"Coverage: {coverage_pct:.2f}%")
 
 
+def _finish_polygon_run(
+    area_df,
+    hubs,
+    covered_postcodes,
+    cleaned_polygon,
+    hub_radius_km,
+    radius_unit,
+    title,
+    create_map_output,
+    map_filename,
+    coverage=None,
+    coverage_mode="straight",
+    coverage_label=None,
+    extra=None,
+):
+    """Shared tail of the polygon runners: totals, postcode mappings, map, result dict."""
+    total_population = float(area_df["population"].sum())
+    covered_population = float(
+        area_df.loc[area_df["postcode"].isin(covered_postcodes), "population"].sum()
+    )
+    coverage_pct = 0.0 if total_population == 0 else 100.0 * covered_population / total_population
+
+    print_hub_results(hubs, covered_population, total_population, coverage_pct, title)
+
+    multi_df, single_df = build_postcode_hub_mappings(
+        area_df, hubs, hub_radius_km, radius_unit, coverage=coverage
+    )
+
+    if create_map_output:
+        create_hub_map(
+            hub_radius_km=hub_radius_km,
+            hubs=hubs,
+            unit=radius_unit,
+            output_file=map_filename,
+            boundary_points=cleaned_polygon,
+            coverage_df=multi_df if coverage is not None else None,
+            coverage_label=coverage_label,
+        )
+
+    result = {
+        "hubs": hubs,
+        "covered_postcodes": covered_postcodes,
+        "total_population": total_population,
+        "covered_population": covered_population,
+        "coverage_pct": coverage_pct,
+        "boundary_points": cleaned_polygon,
+        "radius_unit": radius_unit,
+        "hub_radius_km": hub_radius_km,
+        "coverage_mode": coverage_mode,
+        "coverage_label": coverage_label,
+        "multi_hub_df": multi_df,
+        "single_hub_df": single_df,
+        "notes": list(_RUN_NOTES),
+    }
+    if extra:
+        result.update(extra)
+    return result
+
+
+def _load_area(boundary_points):
+    _RUN_NOTES.clear()
+    polygon = validate_boundary_points(boundary_points)
+    lats = [p[0] for p in polygon]
+    lons = [p[1] for p in polygon]
+    df = load_postcode_data(bbox=(min(lats), min(lons), max(lats), max(lons)))
+    area_df, cleaned_polygon = filter_polygon(df, boundary_points)
+    del df
+    if area_df.empty:
+        raise ValueError(
+            "No postcode data found inside the polygon boundary. "
+            "Check that the points define a sensible area."
+        )
+    return area_df.reset_index(drop=True), cleaned_polygon
+
+
 # --------------------------------------------------
 # Fixed hubs runner: polygon mode
 # --------------------------------------------------
@@ -767,58 +1036,31 @@ def run_fixed_hub_coverage_polygon(
     hub_radius,
     radius_unit="km",
     create_map_output=True,
-    map_filename="Fixed_Hub_Map_Polygon.html"
+    map_filename="Fixed_Hub_Map_Polygon.html",
+    coverage_mode="straight",
+    max_drive_time_min=None,
+    speed_factor=0.6,
 ):
+    """
+    Coverage of user-supplied hubs. `coverage_mode` is "straight" (radius),
+    "road_distance" (hub_radius along roads) or "drive_time"
+    (max_drive_time_min at OSM speeds x speed_factor) -- see build_road_coverage.
+    """
     hub_radius_km = convert_to_km(hub_radius, radius_unit)
+    area_df, cleaned_polygon = _load_area(boundary_points)
+    hubs = validate_fixed_hubs(hubs)
 
-    df = load_postcode_data()
-
-    area_df, cleaned_polygon = filter_polygon(df, boundary_points)
-
-    if area_df.empty:
-        raise ValueError(
-            "No postcode data found inside the polygon boundary. "
-            "Check that the points define a sensible area."
-        )
-
-    hub_results, covered = evaluate_fixed_hubs(
-        area_df,
-        hubs,
-        hub_radius_km
+    coverage = build_road_coverage(
+        area_df, coverage_mode, hub_radius_km, max_drive_time_min, speed_factor,
+        extra_points=[(h[1], h[2]) for h in hubs],
     )
+    hub_results, covered = evaluate_fixed_hubs(area_df, hubs, hub_radius_km, coverage=coverage)
 
-    total_population = float(area_df["population"].sum())
-    covered_population = float(
-        area_df.loc[area_df["postcode"].isin(covered), "population"].sum()
+    return _finish_polygon_run(
+        area_df, hub_results, covered, cleaned_polygon, hub_radius_km, radius_unit,
+        "FIXED HUB RESULTS", create_map_output, map_filename, coverage, coverage_mode,
+        coverage_description(coverage_mode, hub_radius, radius_unit, max_drive_time_min, speed_factor),
     )
-    coverage_pct = 0.0 if total_population == 0 else 100.0 * covered_population / total_population
-
-    print_hub_results(hub_results, covered_population, total_population, coverage_pct, "FIXED HUB RESULTS")
-
-    if create_map_output:
-        create_hub_map(
-            hub_radius_km=hub_radius_km,
-            hubs=hub_results,
-            unit=radius_unit,
-            output_file=map_filename,
-            boundary_points=cleaned_polygon,
-        )
-
-    multi_df, single_df = build_postcode_hub_mappings(
-        area_df, hub_results, hub_radius_km, radius_unit
-    )
-
-    return {
-        "hubs": hub_results,
-        "covered_postcodes": covered,
-        "total_population": total_population,
-        "covered_population": covered_population,
-        "coverage_pct": coverage_pct,
-        "boundary_points": cleaned_polygon,
-        "radius_unit": radius_unit,
-        "multi_hub_df": multi_df,
-        "single_hub_df": single_df,
-    }
 
 
 # --------------------------------------------------
@@ -833,25 +1075,26 @@ def run_hybrid_optimisation_polygon(
     radius_unit="km",
     grid_spacing_km=1.0,
     map_filename="Hybrid_Hub_Map_Polygon.html",
+    coverage_mode="straight",
+    max_drive_time_min=None,
+    speed_factor=0.6,
 ):
     """
     Evaluate a set of user-supplied fixed hubs, then greedily optimise
     `num_free_hubs` additional locations on whatever demand remains uncovered.
     """
     hub_radius_km = convert_to_km(hub_radius, radius_unit)
+    area_df, cleaned_polygon = _load_area(boundary_points)
+    fixed_hubs = validate_fixed_hubs(fixed_hubs)
 
-    df = load_postcode_data()
-    area_df, cleaned_polygon = filter_polygon(df, boundary_points)
-
-    if area_df.empty:
-        raise ValueError(
-            "No postcode data found inside the polygon boundary. "
-            "Check that the points define a sensible area."
-        )
+    coverage = build_road_coverage(
+        area_df, coverage_mode, hub_radius_km, max_drive_time_min, speed_factor,
+        extra_points=[(h[1], h[2]) for h in fixed_hubs],
+    )
 
     # --- Stage 1: evaluate fixed hubs ---
     fixed_results, covered_postcodes = evaluate_fixed_hubs(
-        area_df, fixed_hubs, hub_radius_km
+        area_df, fixed_hubs, hub_radius_km, coverage=coverage
     )
 
     print(f"\nFixed hubs evaluated. Covered postcodes so far: {len(covered_postcodes):,}")
@@ -860,7 +1103,8 @@ def run_hybrid_optimisation_polygon(
     free_results = []
 
     if num_free_hubs > 0:
-        remaining_df = area_df[~area_df["postcode"].isin(covered_postcodes)].copy()
+        remaining_mask = ~area_df["postcode"].isin(covered_postcodes).to_numpy()
+        remaining_df = area_df[remaining_mask].copy()
 
         if remaining_df.empty:
             print("All demand already covered by fixed hubs; no free hubs placed.")
@@ -875,6 +1119,7 @@ def run_hybrid_optimisation_polygon(
                 grid_spacing_km=grid_spacing_km,
                 jostle_radius_km=2.0,
                 refine_passes=3,
+                coverage=coverage.subset(remaining_mask) if coverage is not None else None,
             )
 
             offset = len(fixed_results)
@@ -889,42 +1134,12 @@ def run_hybrid_optimisation_polygon(
             free_results = raw_free
             covered_postcodes.update(free_covered)
 
-    all_hubs = fixed_results + free_results
-
-    total_population = float(area_df["population"].sum())
-    covered_population = float(
-        area_df.loc[area_df["postcode"].isin(covered_postcodes), "population"].sum()
+    return _finish_polygon_run(
+        area_df, fixed_results + free_results, covered_postcodes, cleaned_polygon,
+        hub_radius_km, radius_unit, "HYBRID HUB RESULTS", True, map_filename,
+        coverage, coverage_mode,
+        coverage_description(coverage_mode, hub_radius, radius_unit, max_drive_time_min, speed_factor),
     )
-    coverage_pct = (
-        0.0 if total_population == 0
-        else 100.0 * covered_population / total_population
-    )
-
-    print_hub_results(all_hubs, covered_population, total_population, coverage_pct, "HYBRID HUB RESULTS")
-
-    create_hub_map(
-        hub_radius_km=hub_radius_km,
-        hubs=all_hubs,
-        unit=radius_unit,
-        output_file=map_filename,
-        boundary_points=cleaned_polygon,
-    )
-
-    multi_df, single_df = build_postcode_hub_mappings(
-        area_df, all_hubs, hub_radius_km, radius_unit
-    )
-
-    return {
-        "hubs":               all_hubs,
-        "covered_postcodes":  covered_postcodes,
-        "total_population":   total_population,
-        "covered_population": covered_population,
-        "coverage_pct":       coverage_pct,
-        "boundary_points":    cleaned_polygon,
-        "radius_unit": radius_unit,
-        "multi_hub_df": multi_df,
-        "single_hub_df": single_df,
-    }
 
 
 # --------------------------------------------------
@@ -1115,6 +1330,85 @@ def optimise_hubs_fast(df, num_hubs, hub_radius_km, candidate_stride=1):
     return hubs, covered_postcodes
 
 
+# Memory/time guard for the candidate coverage lists (see _candidate_coverage).
+COVERAGE_BUDGET_MB = float(os.environ.get("HUB_COVERAGE_BUDGET_MB", "500"))
+MAX_CANDIDATES = int(os.environ.get("HUB_MAX_CANDIDATES", "6000"))
+_RUN_NOTES = []   # user-facing notes from the current run (e.g. grid coarsened)
+
+
+def _candidate_sites(demand_df, grid_spacing_km, coverage):
+    grid = _generate_grid_candidates(demand_df, grid_spacing_km)
+    if coverage is None:
+        return grid
+    return coverage.candidate_sites(grid[:, 0], grid[:, 1])
+
+
+def _candidate_coverage(demand_df, hub_radius_km, grid_spacing_km, coverage=None):
+    """
+    Candidate hub sites on a grid over the demand area, and which demand rows
+    each one covers (an array of int32 row-index arrays). With a RoadCoverage,
+    candidates are snapped onto unique road junctions and coverage is
+    measured along the road network.
+
+    Memory guard: these lists are held for every candidate at once, and grow
+    with (area x reach). Before building them, a sample of candidates is used
+    to estimate their total size; if that exceeds COVERAGE_BUDGET_MB, or there
+    are more than MAX_CANDIDATES sites, the grid spacing is widened until it
+    fits, and a note is recorded for the UI.
+    """
+    if coverage is not None and len(coverage) != len(demand_df):
+        raise ValueError("Road coverage is out of sync with the demand data.")
+
+    if coverage is None:
+        demand_tree = BallTree(
+            np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32)), metric="haversine"
+        )
+        radius_rad = hub_radius_km / EARTH_RADIUS_KM
+
+        def reach(points):
+            return [
+                idx.astype(np.int32)
+                for idx in demand_tree.query_radius(np.radians(points), r=radius_rad)
+            ]
+    else:
+        def reach(points):
+            return coverage.reach(points[:, 0], points[:, 1])
+
+    requested = float(grid_spacing_km)
+    spacing = requested
+    rng = np.random.default_rng(0)
+    for _ in range(6):
+        candidates = _candidate_sites(demand_df, spacing, coverage)
+        n = len(candidates)
+        sample = candidates[rng.choice(n, size=min(n, 150), replace=False)] if n else candidates
+        mean_len = float(np.mean([len(x) for x in reach(sample)])) if len(sample) else 0.0
+        est_mb = n * (mean_len * 4 + 112) / 1e6   # int32 entries + per-array overhead
+        scale = max(est_mb / COVERAGE_BUDGET_MB, n / MAX_CANDIDATES)
+        if scale <= 1.0:
+            break
+        spacing = round(spacing * float(np.sqrt(scale)) * 1.1, 2)
+        print(f"Coverage lists estimated at {est_mb:,.0f} MB for {n:,} sites; widening grid to {spacing} km...")
+    else:
+        raise ValueError(
+            "This area is too large to optimise within the memory limit. "
+            "Draw a smaller area, reduce the hub radius / drive time, or raise the grid spacing."
+        )
+
+    if spacing > requested:
+        _RUN_NOTES.append(
+            f"Grid spacing was raised from {requested:g} km to {spacing:g} km to keep memory "
+            f"and run time within limits for an area this size."
+        )
+
+    label = "junction candidates" if coverage is not None else "grid candidates"
+    print(f"Precomputing coverage for {len(candidates):,} {label} ({spacing} km spacing)...")
+    neighbor_indices = np.empty(len(candidates), dtype=object)
+    for c0 in range(0, len(candidates), 256):
+        for k, idx in enumerate(reach(candidates[c0:c0 + 256])):
+            neighbor_indices[c0 + k] = idx
+    return candidates, neighbor_indices
+
+
 def optimise_hubs_fast_refined(
     df,
     num_hubs,
@@ -1122,26 +1416,20 @@ def optimise_hubs_fast_refined(
     grid_spacing_km=1.0,
     jostle_radius_km=2.0,
     refine_passes=3,
-    min_improvement_population=1.0
+    min_improvement_population=1.0,
+    coverage=None,
 ):
     if df.empty:
         raise ValueError("No postcode rows found inside the search area.")
 
     demand_df = df.reset_index(drop=True)
 
-    candidate_latlons = _generate_grid_candidates(demand_df, grid_spacing_km)
-
-    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
+    candidate_latlons, neighbor_indices = _candidate_coverage(
+        demand_df, hub_radius_km, grid_spacing_km, coverage
+    )
     candidate_coords = np.radians(candidate_latlons)
-
-    demand_tree = BallTree(demand_coords, metric="haversine")
     candidate_tree = BallTree(candidate_coords, metric="haversine")
-
-    hub_radius_rad = hub_radius_km / EARTH_RADIUS_KM
     jostle_radius_rad = jostle_radius_km / EARTH_RADIUS_KM
-
-    print(f"Precomputing hub coverage for {len(candidate_latlons):,} grid candidates ({grid_spacing_km} km spacing)...")
-    neighbor_indices = demand_tree.query_radius(candidate_coords, r=hub_radius_rad)
 
     populations = demand_df["population"].to_numpy(dtype=np.float32)
     households = demand_df["households"].to_numpy(dtype=np.float32)
@@ -1311,6 +1599,7 @@ def optimise_hubs_by_coverage(
     jostle_radius_km=2.0,
     refine_passes=3,
     min_improvement_population=1.0,
+    coverage=None,
 ):
     if df.empty:
         raise ValueError("No postcode rows found inside the search area.")
@@ -1323,19 +1612,12 @@ def optimise_hubs_by_coverage(
 
     target_population = total_population * target_coverage_pct / 100.0
 
-    candidate_latlons = _generate_grid_candidates(demand_df, grid_spacing_km)
-
-    demand_coords = np.radians(demand_df[["lat", "lon"]].to_numpy(dtype=np.float32))
+    candidate_latlons, neighbor_indices = _candidate_coverage(
+        demand_df, hub_radius_km, grid_spacing_km, coverage
+    )
     candidate_coords = np.radians(candidate_latlons)
-
-    demand_tree = BallTree(demand_coords, metric="haversine")
     candidate_tree = BallTree(candidate_coords, metric="haversine")
-
-    hub_radius_rad = hub_radius_km / EARTH_RADIUS_KM
     jostle_radius_rad = jostle_radius_km / EARTH_RADIUS_KM
-
-    print(f"Precomputing hub coverage for {len(candidate_latlons):,} grid candidates ({grid_spacing_km} km spacing)...")
-    neighbor_indices = demand_tree.query_radius(candidate_coords, r=hub_radius_rad)
 
     populations = demand_df["population"].to_numpy(dtype=np.float32)
     households = demand_df["households"].to_numpy(dtype=np.float32)
@@ -1501,18 +1783,15 @@ def run_hub_optimisation_polygon_by_coverage(
     grid_spacing_km=1.0,
     create_map_output=True,
     map_filename="Hub_Map_Polygon_Coverage.html",
+    coverage_mode="straight",
+    max_drive_time_min=None,
+    speed_factor=0.6,
 ):
     hub_radius_km = convert_to_km(hub_radius, radius_unit)
-
-    df = load_postcode_data()
-
-    area_df, cleaned_polygon = filter_polygon(df, boundary_points)
-
-    if area_df.empty:
-        raise ValueError(
-            "No postcode data found inside the polygon boundary. "
-            "Check that the points are in the right order and cover a sensible area."
-        )
+    area_df, cleaned_polygon = _load_area(boundary_points)
+    coverage = build_road_coverage(
+        area_df, coverage_mode, hub_radius_km, max_drive_time_min, speed_factor
+    )
 
     hubs, covered = optimise_hubs_by_coverage(
         area_df,
@@ -1522,42 +1801,15 @@ def run_hub_optimisation_polygon_by_coverage(
         grid_spacing_km=grid_spacing_km,
         jostle_radius_km=2.0,
         refine_passes=3,
+        coverage=coverage,
     )
 
-    total_population = area_df["population"].sum()
-    covered_population = area_df.loc[
-        area_df["postcode"].isin(covered), "population"
-    ].sum()
-
-    coverage_pct = 0 if total_population == 0 else 100 * covered_population / total_population
-
-    print_hub_results(hubs, covered_population, total_population, coverage_pct, "COVERAGE TARGET RESULTS")
-
-    if create_map_output:
-        create_hub_map(
-            hub_radius_km=hub_radius_km,
-            hubs=hubs,
-            unit=radius_unit,
-            output_file=map_filename,
-            boundary_points=cleaned_polygon,
-        )
-
-    multi_df, single_df = build_postcode_hub_mappings(
-        area_df, hubs, hub_radius_km, radius_unit
+    return _finish_polygon_run(
+        area_df, hubs, covered, cleaned_polygon, hub_radius_km, radius_unit,
+        "COVERAGE TARGET RESULTS", create_map_output, map_filename, coverage, coverage_mode,
+        coverage_description(coverage_mode, hub_radius, radius_unit, max_drive_time_min, speed_factor),
+        extra={"target_coverage_pct": target_coverage_pct},
     )
-
-    return {
-        "hubs": hubs,
-        "covered_postcodes": covered,
-        "total_population": float(total_population),
-        "covered_population": float(covered_population),
-        "coverage_pct": float(coverage_pct),
-        "target_coverage_pct": target_coverage_pct,
-        "boundary_points": cleaned_polygon,
-        "radius_unit": radius_unit,
-        "multi_hub_df": multi_df,
-        "single_hub_df": single_df,
-    }
 
 
 # --------------------------------------------------
@@ -1627,70 +1879,38 @@ def run_hub_optimisation_polygon(
     use_optimized=True,
     grid_spacing_km=1.0,
     create_map_output=True,
-    map_filename="Hub_Map_Polygon.html"
+    map_filename="Hub_Map_Polygon.html",
+    coverage_mode="straight",
+    max_drive_time_min=None,
+    speed_factor=0.6,
 ):
     hub_radius_km = convert_to_km(hub_radius, radius_unit)
-
-    df = load_postcode_data()
-
-    area_df, cleaned_polygon = filter_polygon(df, boundary_points)
-
-    if area_df.empty:
-        raise ValueError(
-            "No postcode data found inside the polygon boundary. "
-            "Check that the points are in the right order and cover a sensible area."
-        )
+    area_df, cleaned_polygon = _load_area(boundary_points)
 
     if use_optimized:
+        coverage = build_road_coverage(
+            area_df, coverage_mode, hub_radius_km, max_drive_time_min, speed_factor
+        )
         hubs, covered = optimise_hubs_fast_refined(
             area_df,
             num_hubs,
             hub_radius_km,
             grid_spacing_km=grid_spacing_km,
             jostle_radius_km=2.0,
-            refine_passes=3
+            refine_passes=3,
+            coverage=coverage,
         )
     else:
-        hubs, covered = optimise_hubs_bruteforce(
-            area_df,
-            num_hubs,
-            hub_radius_km
-        )
+        if coverage_mode not in (None, "straight"):
+            raise ValueError("Road-network coverage requires the optimised method.")
+        coverage = None
+        hubs, covered = optimise_hubs_bruteforce(area_df, num_hubs, hub_radius_km)
 
-    total_population = area_df["population"].sum()
-    covered_population = area_df.loc[
-        area_df["postcode"].isin(covered),
-        "population"
-    ].sum()
-
-    coverage_pct = 0 if total_population == 0 else 100 * covered_population / total_population
-
-    print_hub_results(hubs, covered_population, total_population, coverage_pct, "POLYGON HUB RESULTS")
-
-    if create_map_output:
-        create_hub_map(
-            hub_radius_km=hub_radius_km,
-            hubs=hubs,
-            unit=radius_unit,
-            output_file=map_filename,
-            boundary_points=cleaned_polygon,
-        )
-
-    multi_df, single_df = build_postcode_hub_mappings(
-        area_df, hubs, hub_radius_km, radius_unit
+    return _finish_polygon_run(
+        area_df, hubs, covered, cleaned_polygon, hub_radius_km, radius_unit,
+        "POLYGON HUB RESULTS", create_map_output, map_filename, coverage, coverage_mode,
+        coverage_description(coverage_mode, hub_radius, radius_unit, max_drive_time_min, speed_factor),
     )
-
-    return {
-        "hubs": hubs,
-        "covered_postcodes": covered,
-        "total_population": float(total_population),
-        "covered_population": float(covered_population),
-        "coverage_pct": float(coverage_pct),
-        "boundary_points": cleaned_polygon,
-        "radius_unit": radius_unit,
-        "multi_hub_df": multi_df,
-        "single_hub_df": single_df,
-    }
 
 
 def find_nearest_postcode(lat, lon, df):
@@ -1705,14 +1925,22 @@ def find_nearest_postcode(lat, lon, df):
     return df.iloc[nearest_idx]["postcode"]
 
 
-def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit="miles"):
+def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit="miles", coverage=None):
     """
     Returns two DataFrames:
       multi_df  – one row per (postcode, hub) pair where the hub covers that postcode.
       single_df – one row per postcode, assigned to its nearest covering hub
                   (tie-broken by hub_number, i.e. order placed during optimisation).
+
+    With a RoadCoverage, "covers" and "nearest" are measured along the road
+    network (drive time or road distance) instead of straight-line distance.
     """
-    dist_col = f"Distance ({radius_unit})"
+    if coverage is None:
+        dist_col = f"Distance ({radius_unit})"
+    else:
+        dist_col = coverage.cost_column(radius_unit)
+        if len(coverage) != len(area_df):
+            raise ValueError("Road coverage is out of sync with the demand data.")
     cols = ["Postcode", "Lat", "Lon", "Hub", "Hub Number", dist_col]
 
     if area_df.empty or not hub_results:
@@ -1733,13 +1961,17 @@ def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit
         hub_name   = hub.get("hub_name", f"Hub {hub['hub_number']}")
         hub_number = hub["hub_number"]
 
-        dists_km = haversine_array(hub_lat, hub_lon, pc_lats, pc_lons)
-        in_range = np.where(dists_km <= hub_radius_km)[0]
+        if coverage is None:
+            dists_km = haversine_array(hub_lat, hub_lon, pc_lats, pc_lons)
+            in_range = np.where(dists_km <= hub_radius_km)[0]
+            rank_cost = dists_km[in_range]
+            dists_display = rank_cost / KM_PER_MILE if use_miles else rank_cost
+        else:
+            in_range, rank_cost = coverage.reach([hub_lat], [hub_lon], return_costs=True)[0]
+            dists_display = coverage.cost_display(rank_cost, radius_unit)
 
         if len(in_range) == 0:
             continue
-
-        dists_display = dists_km[in_range] / KM_PER_MILE if use_miles else dists_km[in_range]
 
         batch = area_df.iloc[in_range][["postcode", "lat", "lon"]].copy()
         batch.columns = ["Postcode", "Lat", "Lon"]
@@ -1752,7 +1984,7 @@ def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit
 
         # nearest-hub tracking
         for arr_pos, df_idx in enumerate(in_range):
-            d_km  = float(dists_km[df_idx])
+            d_km  = float(rank_cost[arr_pos])
             d_dis = float(dists_display[arr_pos])
             prev  = best.get(df_idx)
             if prev is None or d_km < prev[0] or (d_km == prev[0] and hub_number < prev[1]):
@@ -1785,6 +2017,394 @@ def build_postcode_hub_mappings(area_df, hub_results, hub_radius_km, radius_unit
 
     return multi_df, single_df
 
+
+# --------------------------------------------------
+# Milk rounds: mothership -> hub routing
+# --------------------------------------------------
+
+ROUTE_COLORS = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4",
+    "#f032e6", "#9a6324", "#469990", "#800000", "#808000", "#000075",
+]
+
+# Objective weights for the routing solver, in descending priority:
+# arriving late anywhere >> using an extra round (auto mode only) >> drive time.
+_LATE_PENALTY_PER_SECOND = 1_000_000
+_ROUND_FIXED_COST = 10_000_000
+
+
+def estimate_travel_matrix(lats, lons, road_factor=1.3, avg_speed_kmh=32.0):
+    """
+    Estimated road distance (km) and drive time (minutes) between every pair
+    of points: straight-line distance x `road_factor`, driven at a constant
+    `avg_speed_kmh`.
+
+    This is a deliberate placeholder for a real road-network matrix. The
+    routing code only depends on the two returned (n x n) matrices, so a
+    road-graph-based version can replace this later without touching
+    plan_milk_rounds.
+    """
+    if avg_speed_kmh <= 0:
+        raise ValueError("Average speed must be greater than zero.")
+    if road_factor <= 0:
+        raise ValueError("Road factor must be greater than zero.")
+
+    lats = np.asarray(lats, dtype=np.float64)
+    lons = np.asarray(lons, dtype=np.float64)
+    n = len(lats)
+    dist_km = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        dist_km[i] = haversine_array(lats[i], lons[i], lats, lons)
+    dist_km *= road_factor
+    minutes = dist_km / avg_speed_kmh * 60.0
+    return dist_km, minutes
+
+
+def _fmt_hmm(minutes):
+    minutes = int(round(float(minutes)))
+    return f"{minutes // 60}:{minutes % 60:02d}"
+
+
+def plan_milk_rounds(
+    motherships,
+    stops,
+    num_rounds=None,
+    time_window_min=120.0,
+    unload_min=15.0,
+    road_factor=1.3,
+    avg_speed_kmh=32.0,
+    radius_unit="miles",
+    time_limit_s=10,
+    travel=None,
+):
+    """
+    `travel`, if given, is a precomputed (dist_km, minutes, paths) tuple for
+    the points [*motherships, *stops] in that order -- e.g. from
+    road_network.road_travel_matrix -- and replaces the straight-line
+    estimate. paths[(i, j)] is the [(lat, lon), ...] road path for drawing.
+
+    Plan "milk rounds": vehicle routes that leave a mothership and deliver to
+    a sequence of hubs, unloading for `unload_min` at each.
+
+    motherships / stops: lists of dicts with "name", "lat", "lon" and
+    optionally "hub_number".
+
+    Every stop is visited exactly once, by a round starting from one of the
+    motherships (multi-depot VRP, solved with OR-Tools). Arrival time at a
+    stop counts drive time plus unloading at earlier stops on the same round.
+    `time_window_min` applies to arrival at each stop; the return leg to the
+    mothership is reported but not counted against the window.
+
+    - num_rounds None/0 ("auto"): use as few rounds as possible while
+      reaching every stop within the window, then minimise drive time.
+    - num_rounds = K: use at most K rounds in total (across all motherships),
+      minimising lateness first and drive time second. If K rounds can't hit
+      the window, late stops are reported rather than failing.
+
+    Travel times come from estimate_travel_matrix (straight line x
+    road_factor at avg_speed_kmh) for now.
+    """
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+    if not motherships:
+        raise ValueError("At least one mothership is required to plan milk rounds.")
+    if time_window_min <= 0:
+        raise ValueError("Time window must be greater than zero.")
+    if unload_min < 0:
+        raise ValueError("Unload time cannot be negative.")
+
+    use_miles = radius_unit.lower() in ("mile", "miles", "mi")
+    dist_unit = "miles" if use_miles else "km"
+    settings = {
+        "num_rounds": int(num_rounds) if num_rounds else None,
+        "time_window_min": float(time_window_min),
+        "unload_min": float(unload_min),
+        "road_factor": float(road_factor),
+        "avg_speed_kmh": float(avg_speed_kmh),
+        "distance_unit": dist_unit,
+        "travel_source": "road network" if travel is not None else "estimated",
+    }
+
+    empty = {
+        "rounds": [],
+        "stops_df": pd.DataFrame(),
+        "rounds_df": pd.DataFrame(),
+        "rounds_used": 0,
+        "late_stops": 0,
+        "total_drive_distance": 0.0,
+        "total_drive_min": 0.0,
+        "settings": settings,
+        "mode": "auto" if not num_rounds else "fixed",
+    }
+    if not stops:
+        return empty
+
+    n_depots = len(motherships)
+    n_stops = len(stops)
+    points = list(motherships) + list(stops)
+    est_km, est_min = estimate_travel_matrix(
+        [p["lat"] for p in points], [p["lon"] for p in points],
+        road_factor=road_factor, avg_speed_kmh=avg_speed_kmh,
+    )
+    leg_paths = {}
+    unreachable_pairs = 0
+    if travel is None:
+        dist_km, minutes = est_km, est_min
+    else:
+        dist_km, minutes, leg_paths = travel
+        dist_km = np.array(dist_km, dtype=np.float64)
+        minutes = np.array(minutes, dtype=np.float64)
+        # Pairs with no road route (e.g. a point snapped onto a disconnected
+        # island of the network) fall back to the estimate rather than failing.
+        bad = ~np.isfinite(minutes) | ~np.isfinite(dist_km)
+        unreachable_pairs = int(bad.sum())
+        dist_km[bad] = est_km[bad]
+        minutes[bad] = est_min[bad]
+    settings["unreachable_pairs"] = unreachable_pairs
+
+    def _leg_path(i, j):
+        return leg_paths.get((i, j)) or [
+            (float(points[i]["lat"]), float(points[i]["lon"])),
+            (float(points[j]["lat"]), float(points[j]["lon"])),
+        ]
+
+    # Open routes: every round ends at a dummy node reachable from anywhere
+    # at zero cost, so the return leg doesn't distort the optimisation.
+    end_node = n_depots + n_stops
+    n_nodes = end_node + 1
+
+    travel_s = np.rint(minutes * 60.0).astype(np.int64)
+    unload_s = int(round(unload_min * 60.0))
+    window_s = int(round(time_window_min * 60.0))
+
+    auto_mode = not num_rounds
+    rounds_per_depot = n_stops if auto_mode else min(int(num_rounds), n_stops)
+    starts = [d for d in range(n_depots) for _ in range(rounds_per_depot)]
+    ends = [end_node] * len(starts)
+    n_vehicles = len(starts)
+
+    manager = pywrapcp.RoutingIndexManager(n_nodes, n_vehicles, starts, ends)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def _drive(i, j):
+        if i == end_node or j == end_node:
+            return 0
+        return int(travel_s[i, j])
+
+    def drive_cb(from_index, to_index):
+        return _drive(manager.IndexToNode(from_index), manager.IndexToNode(to_index))
+
+    def time_cb(from_index, to_index):
+        i = manager.IndexToNode(from_index)
+        j = manager.IndexToNode(to_index)
+        service = unload_s if n_depots <= i < end_node else 0
+        return _drive(i, j) + service
+
+    drive_idx = routing.RegisterTransitCallback(drive_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(drive_idx)
+
+    time_idx = routing.RegisterTransitCallback(time_cb)
+    horizon = int(travel_s.max()) * (n_stops + 1) + unload_s * (n_stops + 1) + window_s + 1
+    routing.AddDimension(time_idx, 0, horizon, True, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
+    for node in range(n_depots, end_node):
+        time_dim.SetCumulVarSoftUpperBound(
+            manager.NodeToIndex(node), window_s, _LATE_PENALTY_PER_SECOND
+        )
+
+    if auto_mode:
+        routing.SetFixedCostOfAllVehicles(_ROUND_FIXED_COST)
+    elif n_depots > 1:
+        # K rounds are a shared budget across all motherships.
+        solver = routing.solver()
+        solver.Add(
+            solver.Sum([routing.ActiveVehicleVar(v) for v in range(n_vehicles)])
+            <= int(num_rounds)
+        )
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    # Guided local search runs until the time limit, so scale it to problem size.
+    params.time_limit.FromSeconds(int(min(max(2, 1 + n_stops // 3), time_limit_s)))
+
+    solution = routing.SolveWithParameters(params)
+    if solution is None:
+        raise RuntimeError("Routing solver could not find a solution for the milk rounds.")
+
+    to_display = (lambda km: km / KM_PER_MILE) if use_miles else (lambda km: km)
+
+    rounds = []
+    for v in range(n_vehicles):
+        if not routing.IsVehicleUsed(solution, v):
+            continue
+        depot = starts[v]
+        mothership = motherships[depot]
+        stop_rows = []
+        path = [(float(mothership["lat"]), float(mothership["lon"]))]
+        prev = depot
+        drive_km = 0.0
+        drive_min = 0.0
+
+        index = solution.Value(routing.NextVar(routing.Start(v)))
+        seq = 0
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            stop = stops[node - n_depots]
+            seq += 1
+            leg_km = float(dist_km[prev, node])
+            leg_min = float(minutes[prev, node])
+            drive_km += leg_km
+            drive_min += leg_min
+            arrival_min = solution.Min(time_dim.CumulVar(index)) / 60.0
+            stop_rows.append({
+                "sequence": seq,
+                "hub": stop["name"],
+                "hub_number": stop.get("hub_number"),
+                "lat": float(stop["lat"]),
+                "lon": float(stop["lon"]),
+                "leg_distance": to_display(leg_km),
+                "leg_min": leg_min,
+                "arrival_min": arrival_min,
+                "depart_min": arrival_min + unload_min,
+                "late_min": max(0.0, arrival_min - time_window_min),
+            })
+            path.extend(_leg_path(prev, node)[1:])
+            prev = node
+            index = solution.Value(routing.NextVar(index))
+
+        if not stop_rows:
+            continue
+
+        return_km = float(dist_km[prev, depot])
+        return_min = float(minutes[prev, depot])
+        rounds.append({
+            "mothership": mothership["name"],
+            "mothership_hub_number": mothership.get("hub_number"),
+            "mothership_lat": float(mothership["lat"]),
+            "mothership_lon": float(mothership["lon"]),
+            "stops": stop_rows,
+            "path": path,
+            "return_path": _leg_path(prev, depot),
+            "outbound_distance": to_display(drive_km),
+            "outbound_drive_min": drive_min,
+            "last_arrival_min": stop_rows[-1]["arrival_min"],
+            "last_depart_min": stop_rows[-1]["depart_min"],
+            "return_distance": to_display(return_km),
+            "return_min": return_min,
+            "total_round_min": stop_rows[-1]["depart_min"] + return_min,
+            "late_stops": sum(1 for s in stop_rows if s["late_min"] > 0),
+        })
+
+    rounds.sort(key=lambda r: (r["mothership"], r["stops"][0]["hub"]))
+    for i, r in enumerate(rounds, start=1):
+        r["round_number"] = i
+        r["color"] = ROUTE_COLORS[(i - 1) % len(ROUTE_COLORS)]
+
+    dist_col = f"Leg Distance ({dist_unit})"
+    stop_records = []
+    for r in rounds:
+        for s in r["stops"]:
+            stop_records.append({
+                "Round": r["round_number"],
+                "Mothership": r["mothership"],
+                "Stop": s["sequence"],
+                "Hub": s["hub"],
+                "Lat": round(s["lat"], 5),
+                "Lon": round(s["lon"], 5),
+                dist_col: round(s["leg_distance"], 2),
+                "Leg Drive (min)": round(s["leg_min"], 1),
+                "Arrival (min)": round(s["arrival_min"], 1),
+                "Arrival (h:mm)": _fmt_hmm(s["arrival_min"]),
+                "Depart (h:mm)": _fmt_hmm(s["depart_min"]),
+                "Late (min)": round(s["late_min"], 1),
+            })
+
+    round_records = [{
+        "Round": r["round_number"],
+        "Mothership": r["mothership"],
+        "Stops": len(r["stops"]),
+        "Route": " → ".join(s["hub"] for s in r["stops"]),
+        f"Outbound Distance ({dist_unit})": round(r["outbound_distance"], 1),
+        "Last Arrival (h:mm)": _fmt_hmm(r["last_arrival_min"]),
+        "Return Drive (min)": round(r["return_min"], 1),
+        "Total Round incl. Return (h:mm)": _fmt_hmm(r["total_round_min"]),
+        "Late Stops": r["late_stops"],
+    } for r in rounds]
+
+    return {
+        "rounds": rounds,
+        "stops_df": pd.DataFrame(stop_records),
+        "rounds_df": pd.DataFrame(round_records),
+        "rounds_used": len(rounds),
+        "late_stops": sum(r["late_stops"] for r in rounds),
+        "total_drive_distance": sum(r["outbound_distance"] for r in rounds),
+        "total_drive_min": sum(r["outbound_drive_min"] for r in rounds),
+        "settings": settings,
+        "mode": "auto" if auto_mode else "fixed",
+    }
+
+
+def add_milk_rounds_to_result(
+    result,
+    mothership_hub_numbers,
+    hub_radius_km,
+    map_filename,
+    use_road_network=False,
+    speed_factor=0.6,
+    **milk_round_kwargs,
+):
+    """
+    Tag the given hubs in an optimisation result as motherships, plan milk
+    rounds from them to every other hub, store the plan in
+    result["milk_rounds"], and redraw the map with the routes on it.
+
+    use_road_network: take drive times/paths from the OpenStreetMap road
+    network (OSM speeds x speed_factor) instead of the straight-line estimate.
+    """
+    mothership_set = set(mothership_hub_numbers)
+    hubs = result["hubs"]
+    motherships, stops = [], []
+    for h in hubs:
+        h["is_mothership"] = h["hub_number"] in mothership_set
+        entry = {
+            "name": h.get("hub_name", f"Hub {h['hub_number']}"),
+            "lat": float(h["lat"]),
+            "lon": float(h["lon"]),
+            "hub_number": h["hub_number"],
+        }
+        (motherships if h["is_mothership"] else stops).append(entry)
+
+    travel = None
+    if use_road_network and stops and motherships:
+        from road_network import load_road_graph_for_points, road_travel_matrix
+
+        pts = motherships + stops
+        lats = [p["lat"] for p in pts]
+        lons = [p["lon"] for p in pts]
+        graph = load_road_graph_for_points(lats, lons, buffer_km=5.0)
+        travel = road_travel_matrix(graph, lats, lons, speed_factor=speed_factor)
+
+    milk_rounds = plan_milk_rounds(
+        motherships, stops, radius_unit=result.get("radius_unit", "miles"),
+        travel=travel, **milk_round_kwargs,
+    )
+    if travel is not None:
+        milk_rounds["settings"]["speed_factor"] = float(speed_factor)
+    result["milk_rounds"] = milk_rounds
+
+    road_coverage = result.get("coverage_mode", "straight") not in (None, "straight")
+    create_hub_map(
+        hub_radius_km=hub_radius_km,
+        hubs=hubs,
+        unit=result.get("radius_unit", "miles"),
+        output_file=map_filename,
+        boundary_points=result.get("boundary_points"),
+        milk_rounds=milk_rounds,
+        coverage_df=result.get("multi_hub_df") if road_coverage else None,
+        coverage_label=result.get("coverage_label"),
+    )
+    return result
 
 
 # --------------------------------------------------
